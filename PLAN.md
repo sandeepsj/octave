@@ -2,7 +2,8 @@
 title: "Octave — Vision & Goal Chart"
 description: "A free, open, AI-native music studio for the singers and content creators who can't afford a real one. Solo artist in, full song out."
 tags: ["daw", "audio", "mixing", "mastering", "ai", "mcp", "midi", "music-generation", "free", "open-source", "content-creators"]
-audience: "Hobby singers, content creators, bedroom artists — talents whose passion isn't paid for by a label"
+audience: "Hobby singers, content creators, bedroom artists, indie filmmakers, home album-makers, podcasters — talents whose passion isn't paid for by a label"
+output: "Anything a casual listener might press play on — Reels, TikTok, Shorts, podcasts, short-film scores, EPs, singles, full albums"
 license: "Free and public — open to all"
 status: "Phase 0 — pre-foundation"
 ---
@@ -25,6 +26,9 @@ Octave's mission: **let one person, with one mic and one laptop, make the song t
 > [!NOTE]
 > **Octave is free and public.** Forever. This is not a freemium product or a free tier. The full studio — recording, editing, pitch correction, mixing, mastering, AI music generation, AI virtual session musicians — is free for everyone, end to end.
 
+> [!IMPORTANT]
+> **Octave is not a "short-form" tool.** From a 15-second Reels hook to a 4-minute single to a 12-minute short-film score, Octave produces studio-quality output for *every* listening context — Reels, TikTok, Shorts, podcasts, short films, EPs, singles, full albums, anything a casual listener might press play on. Short-form is one use case among many. Same engine, same quality bar, every time.
+
 ## 2. North Star
 
 A solo singer:
@@ -34,10 +38,10 @@ A solo singer:
 3. Tells Octave what backing they want — *"warm lofi piano with soft drums, slow and dreamy, in C minor."*
 4. Octave generates the music.
 5. Asks Octave to add a violin in the chorus, swap drums for a finger snap, double the vocal an octave below.
-6. Asks Octave to mix and master it for Instagram Reels.
-7. Exports a Reels-ready clip and a Spotify-ready master.
+6. Asks Octave to mix and master it — for Spotify, and a vertical cut for Reels.
+7. Exports a Spotify-ready master and a Reels-ready clip from the same project.
 
-End to end: under 30 minutes. No engineering knowledge required. No paid plugins. No subscriptions. No upload to a cloud they don't trust.
+End to end: a Reels cut in minutes, a full single in an afternoon, a short-film score in a weekend. No engineering knowledge required. No paid plugins. No subscriptions. No upload to a cloud they don't trust.
 
 ## 3. Who We Serve
 
@@ -47,7 +51,10 @@ End to end: under 30 minutes. No engineering knowledge required. No paid plugins
 | Persona | Reality | What Octave gives them |
 |---|---|---|
 | **The bedroom singer** | Has a beautiful voice, a USB mic, and no money | Studio-quality vocals + AI band |
-| **The content creator** | Posts to Reels / TikTok / Shorts daily, needs original audio fast | Prompt → finished track in minutes, platform-ready exports |
+| **The short-form creator** | Posts to Reels / TikTok / Shorts daily, needs original audio fast | Prompt → finished hook in minutes, platform-ready exports |
+| **The home album-maker** | Wants to ship a real single or EP to Spotify, not just clips | Full-song depth, mastered to streaming targets, lossless export |
+| **The indie filmmaker** | Needs an original score for a short film, can't hire a composer | Multi-cue scoring, scene-length generation, picture-locked export |
+| **The podcaster** | Needs an intro / outro / bed in the show's voice | Generated stings and beds, loudness-matched, royalty-free |
 | **The pianist with no band** | Plays well, dreams of a string quartet behind them | AI session musicians who play along live |
 | **The hobby songwriter** | Writes lyrics and melodies on guitar, can't notate or arrange | Hum the parts, AI fills in the rest |
 | **The non-engineer** | Doesn't know what compression is, doesn't want to learn | One prompt: *"mix and master this for Spotify"* |
@@ -71,9 +78,9 @@ sequenceDiagram
     Octave-->>Singer: Backing track plays under vocal
     Singer->>AI: "Add a violin in the chorus, double my vocal an octave down"
     AI->>Octave: Add violin, generate vocal double
-    Singer->>AI: "Mix and master it for Reels"
+    Singer->>AI: "Mix and master for Spotify, and cut a Reels version"
     AI->>Octave: Tune vocal, balance levels, master to -14 LUFS
-    Octave-->>Singer: Finished song, Reels clip, Spotify master
+    Octave-->>Singer: Spotify master, Reels cut, lossless stems
 ```
 
 This is the flow we are building toward. Everything else exists to serve this loop.
@@ -174,7 +181,7 @@ flowchart TB
     MASTER[Mastering]
   end
   subgraph SHIP [Ship]
-    EXPORT[Content Creator Export]
+    EXPORT[Output and Delivery]
   end
   subgraph PLATFORM [Platform]
     MCP[MCP / API Layer]
@@ -381,20 +388,46 @@ flowchart TB
 - **Bring-your-own-model** — swap the AI provider; the API surface stays the same
 - **Public, documented, versioned** — third-party tools can integrate
 
-### Pillar 11 — Content Creator Export
+### Pillar 11 — Output & Delivery
 
 > [!TIP]
-> *"From record button to ready-to-post in one click."*
+> *"From record button to ready-to-post — in any format, at any length."*
 
-- **One-tap platform exports** — Reels (15s, 30s, 60s, 90s), TikTok (15s, 60s, 3min), Shorts (60s), Stories (15s)
-- **Loudness pre-targeted per platform** — never get auto-attenuated
-- **Stems for collaboration** — vocals only, instrumental only, individual instrument stems
-- **Karaoke / instrumental version** — vocal removed, ready for cover artists
-- **BPM-locked clips** — clean loop points for transitions and overlays
-- **Embedded metadata** — title, artist, BPM, key, ISRC if needed
-- **Direct-publish links** *(stretch)* — Spotify for Artists, DistroKid, SoundCloud, YouTube
-- **Auto-generated waveform / lyric video** *(stretch)* — vertical video with bouncing waveform for Reels
-- **Project archive** — share the whole session with another Octave user (audio + plugins + AI parts)
+**Full song / streaming releases**
+
+- One-tap streaming masters — Spotify, Apple Music, YouTube, Tidal, Amazon Music, Deezer
+- Loudness pre-targeted per platform; integrated platform-specific check
+- Lossless export (WAV / FLAC) plus high-bitrate MP3 / AAC / Opus
+- ISRC / ISWC / ID3 metadata embedding (title, artist, album, year, BPM, key)
+- CD / DDP export for physical release *(stretch)*
+- Mastered, mid/side-mastered, stem-mastered, instrumental, and clean (radio edit) versions
+
+**Short-form video**
+
+- One-tap social cuts — Reels (15s, 30s, 60s, 90s), TikTok (15s, 60s, 3min), Shorts (60s), Stories (15s)
+- Loudness pre-targeted per platform — never get auto-attenuated
+- Hook-finder — AI suggests the most-clip-worthy 30 seconds of a full song
+- BPM-locked clips with clean loop points for transitions and overlays
+- Auto-generated vertical waveform / lyric video *(stretch)*
+
+**Film / video / podcasts**
+
+- Scene-length / cue-length export with picture-locked timing (in/out points)
+- Multiple cues per project for scoring a short film
+- Theme variation generation — same theme, different intensities and instrumentations across cues
+- Podcast deliverables — intro stings, outro, mid-roll beds, bumpers
+- Loudness-matched to broadcast (-23 LUFS) when needed
+
+**Collaboration / remix / archive**
+
+- Stems — vocals only, instrumental only, every track individually
+- Karaoke / instrumental version (vocal removed for cover artists)
+- Project archive — share the whole session with another Octave user
+- Open session interchange — AAF / OMF for working with engineers on other DAWs
+
+**Direct publish** *(stretch)*
+
+- Spotify for Artists, DistroKid, SoundCloud, YouTube — one click from Octave to release
 
 ### Pillar 12 — UX & Workflow
 
@@ -471,7 +504,7 @@ gantt
     Phase 9 MIDI and Next-Gen Composition             :p9, after p8, 4M
     Phase 10 AI Virtual Session Musicians             :p10, after p9, 6M
     section Ship
-    Phase 11 Content Creator Export Suite             :p11, after p6, 2M
+    Phase 11 Output and Delivery (every format and length) :p11, after p6, 2M
     section Cloud
     Phase 12 Collaboration and Cloud (opt-in)         :p12, after p10, 4M
 ```
@@ -519,6 +552,9 @@ Octave: [0.92, 0.95]
 > Every checkbox is something a *user* — not a developer — has to be able to do.
 
 - [ ] A bedroom singer with a $30 mic records and ships a Reels-ready song to Instagram in under 30 minutes.
+- [ ] A solo songwriter records and masters a 4-minute single, ships it to Spotify at -14 LUFS, in one afternoon.
+- [ ] An indie filmmaker scores a 10-minute short film with multiple themed cues — all generated, mixed, and mastered in Octave, picture-locked to the cut.
+- [ ] A casual listener cannot tell whether an Octave-mastered single was made in a $100 bedroom or a $1000-an-hour studio.
 - [ ] A pianist plays alone, asks for a string quartet, and performs live with virtual musicians who follow their dynamics.
 - [ ] A solo songwriter hums a melody, prompts a full arrangement, and exports a Spotify-ready master without touching a fader.
 - [ ] An AI agent, given a vocal take and a one-line description, produces a finished, mastered song through MCP — zero UI interaction.
@@ -537,6 +573,7 @@ Octave: [0.92, 0.95]
 - **Not a closed garden.** Open source, open formats, open APIs, open plugin standards.
 - **Not SaaS-only.** Runs fully offline. Cloud is opt-in. Your voice does not leave your machine unless you say so.
 - **Not a Suno clone.** Suno generates a song *for* you. Octave generates *with* you — your voice, your performance, stays at the center.
+- **Not short-form only.** Reels are one use case. Full songs for streaming, scores for short films, beds for podcasts, EPs for casual listening — Octave produces studio-quality output for *any* listening context.
 - **Not a toy.** The audio bar is the same as a paid pro DAW.
 
 ## Glossary

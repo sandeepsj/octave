@@ -9,7 +9,7 @@ status: "Phase 0 — pre-foundation (vision phase)"
 
 > *Sing the song. Octave plays the orchestra.*
 
-**Octave is a free, open, AI-native music studio.** It is being designed for the singers, content creators, and bedroom artists who can't afford a real one. Plug in a cheap mic, sing your song, prompt for a backing arrangement, let the AI mix and master it — and ship a Reels-ready clip and a Spotify-ready master from the same project.
+**Octave is a free, open, AI-native music studio.** It is being designed for the singers, content creators, bedroom artists, indie filmmakers, and home album-makers who can't afford a real one. Plug in a cheap mic, sing your song, prompt for a backing arrangement, let the AI mix and master it — and ship anything from a 15-second Reels hook to a 4-minute single to a 12-minute short-film score, all from the same project.
 
 > [!IMPORTANT]
 > Octave is currently in **Phase 0 — pre-foundation**. There is no code yet, only the vision. The full plan lives in [`PLAN.md`](./PLAN.md).
@@ -20,9 +20,15 @@ Not the established pro. Octave is being built for:
 
 - The bedroom singer with a $30 mic and a real voice
 - The Instagram / TikTok / Shorts creator who needs original audio fast
+- The home album-maker who wants to ship a real EP to Spotify
+- The indie filmmaker scoring a short film without a composer's budget
+- The podcaster who needs an intro / outro / bed in the show's voice
 - The pianist who dreams of a string quartet behind them
 - The songwriter who hums melodies but can't notate or arrange
 - The non-engineer who can sing but doesn't know what compression is
+
+> [!IMPORTANT]
+> **Octave is not a "short-form" tool.** From a 15-second Reels hook to a 4-minute single to a 12-minute short-film score — Octave produces studio-quality output for *any* listening context. Same engine, same quality bar, every time.
 
 Pros are welcome — but they are not the design center. *Yet.*
 
@@ -35,7 +41,7 @@ flowchart LR
   PROMPT --> AI[AI generates backing]
   AI --> REFINE[Refine: 'add violin in chorus']
   REFINE --> MIXMA[AI mix + master]
-  MIXMA --> EXPORT[Reels clip + Spotify master]
+  MIXMA --> EXPORT[Spotify master + Reels cut + film cues]
 ```
 
 End to end, under 30 minutes. No studio. No band. No bill.
