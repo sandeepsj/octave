@@ -53,7 +53,30 @@ End to end, under 30 minutes. No studio. No band. No bill.
 ## Vision documents
 
 - [**PLAN.md**](./PLAN.md) — the full vision, goals, feature pillars, roadmap, and success metrics
-- *(more docs to come as the project takes shape)*
+- [**docs/modules/**](./docs/modules) — per-module technical design plans (one file per bounded module)
+
+## How Octave is built
+
+> [!IMPORTANT]
+> Octave is built **one small, fully-understood module at a time.** No code ships without an approved plan.
+
+Every module — *record audio*, *polyphonic pitch correction*, *one-tap Reels export*, *Focusrite hot-plug* — gets a deep technical plan in [`docs/modules/`](./docs/modules) **before any code is written**, covering:
+
+- Hardware (the actual device, its limits, its electrical / acoustic behavior)
+- Drivers / kernel APIs (ALSA / JACK / PipeWire / Core Audio / WASAPI / ASIO)
+- OS / cross-platform abstraction
+- Engine layer (buffers, threading, lock-free constructs)
+- DSP / algorithm layer (named algorithms, math, papers cited)
+- Data and wire formats with byte layouts
+- Performance budgets as concrete numbers
+- Real-time discipline (RT vs non-RT boundary)
+- Failure modes and recovery
+- Public API surface (typed, documented)
+- MCP exposure (every API gets a tool)
+- UI surface (Simple Mode + Studio Mode)
+- Test strategy and acceptance criteria
+
+The plan template is enforced by the project-scoped `module-plan` Claude Code skill at [`.claude/skills/module-plan/SKILL.md`](./.claude/skills/module-plan/SKILL.md). It inherits the doc-to-dashboard markdown conventions for output. Most of our development time is spent **understanding** before **implementing**.
 
 ## Status
 
