@@ -38,6 +38,13 @@ pub enum ServerError {
 /// (the rmcp tool router), and serves on `(tokio::io::stdin(), tokio::io::stdout())`
 /// per the MCP stdio convention.
 ///
+/// # Tool filtering
+/// Reads the `OCTAVE_MCP_TOOLS` environment variable as a
+/// comma-separated allowlist of tool names. Empty or unset = all tools
+/// enabled. Set = only listed tools are advertised by `tools/list` and
+/// accepted by `call_tool`. Unknown names are ignored (logged as a
+/// warning).
+///
 /// # Errors
 /// Returns [`ServerError::AudioThreadSpawn`] if the audio thread can't
 /// start, [`ServerError::Rmcp`] for protocol-level failures, and
@@ -47,7 +54,27 @@ pub async fn serve() -> Result<(), ServerError> {
 
     let actor = AudioActorHandle::spawn()
         .map_err(|e| ServerError::AudioThreadSpawn(e.to_string()))?;
-    let server = OctaveServer::new(actor);
+
+    let server = match parse_tools_env() {
+        None => {
+            tracing::info!(
+                tools = ?OctaveServer::all_tool_names(),
+                "OCTAVE_MCP_TOOLS unset; advertising all tools"
+            );
+            OctaveServer::new(actor)
+        }
+        Some(allowed) => {
+            let known: std::collections::HashSet<String> =
+                OctaveServer::all_tool_names().into_iter().collect();
+            let unknown: Vec<&String> = allowed.iter().filter(|n| !known.contains(*n)).collect();
+            if !unknown.is_empty() {
+                tracing::warn!(?unknown, "OCTAVE_MCP_TOOLS contains unknown names (ignored)");
+            }
+            let (server, enabled) = OctaveServer::with_allowed_tools(actor, &allowed);
+            tracing::info!(?enabled, "OCTAVE_MCP_TOOLS allowlist applied");
+            server
+        }
+    };
 
     let transport = (tokio::io::stdin(), tokio::io::stdout());
     let running = server
@@ -60,4 +87,58 @@ pub async fn serve() -> Result<(), ServerError> {
         .await
         .map_err(|e| ServerError::Rmcp(e.to_string()))?;
     Ok(())
+}
+
+/// Parse `OCTAVE_MCP_TOOLS` into an allowlist set. Returns `None` when
+/// the variable is unset or empty/whitespace, in which case all tools
+/// remain enabled.
+fn parse_tools_env() -> Option<std::collections::HashSet<String>> {
+    let raw = std::env::var("OCTAVE_MCP_TOOLS").ok()?;
+    let set: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tools_env_handles_unset_empty_and_whitespace() {
+        // Use unique scopes per case so concurrent tests don't collide.
+        // SAFETY: env var mutation in tests; serial within this fn.
+        unsafe {
+            std::env::remove_var("OCTAVE_MCP_TOOLS");
+        }
+        assert!(parse_tools_env().is_none(), "unset → None");
+
+        unsafe {
+            std::env::set_var("OCTAVE_MCP_TOOLS", "");
+        }
+        assert!(parse_tools_env().is_none(), "empty → None");
+
+        unsafe {
+            std::env::set_var("OCTAVE_MCP_TOOLS", "  ,  ,");
+        }
+        assert!(parse_tools_env().is_none(), "whitespace+commas → None");
+
+        unsafe {
+            std::env::set_var(
+                "OCTAVE_MCP_TOOLS",
+                " recording_start , recording_stop ,recording_start",
+            );
+        }
+        let s = parse_tools_env().expect("Some");
+        assert_eq!(s.len(), 2);
+        assert!(s.contains("recording_start"));
+        assert!(s.contains("recording_stop"));
+
+        unsafe {
+            std::env::remove_var("OCTAVE_MCP_TOOLS");
+        }
+    }
 }

@@ -10,6 +10,21 @@
 //!   }
 //! }
 //! ```
+//!
+//! ## Tool allowlist
+//!
+//! Set `OCTAVE_MCP_TOOLS` to a comma-separated list of tool names to
+//! advertise only that subset (saves agent context budget). Unset or
+//! empty = all tools enabled.
+//!
+//! ```json
+//! {
+//!   "octave": {
+//!     "command": "octave-mcp",
+//!     "env": { "OCTAVE_MCP_TOOLS": "recording_list_devices,recording_start,recording_stop" }
+//!   }
+//! }
+//! ```
 
 use std::process::ExitCode;
 

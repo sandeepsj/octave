@@ -8,6 +8,7 @@
 //! [`AudioActorHandle`] so the `!Send` `RecordingHandle`s stay on one
 //! thread (see audio_actor.rs).
 
+use std::collections::HashSet;
 use std::time::UNIX_EPOCH;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -36,11 +37,48 @@ pub struct OctaveServer {
 }
 
 impl OctaveServer {
+    /// All tools enabled.
     pub fn new(actor: AudioActorHandle) -> Self {
         Self {
             actor,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Only tools whose names appear in `allowed` are advertised by
+    /// `tools/list` and accepted by `call_tool`. Unknown names in the
+    /// set are ignored. Returns the names of the tools that are actually
+    /// enabled (intersection of `allowed` and the registered tools).
+    pub fn with_allowed_tools(
+        actor: AudioActorHandle,
+        allowed: &HashSet<String>,
+    ) -> (Self, Vec<String>) {
+        let mut tool_router = Self::tool_router();
+        let mut enabled = Vec::new();
+        let names: Vec<String> = tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for name in &names {
+            if allowed.contains(name) {
+                enabled.push(name.clone());
+            } else {
+                tool_router.disable_route(name.clone());
+            }
+        }
+        (Self { actor, tool_router }, enabled)
+    }
+
+    /// Names of every tool the server knows about, regardless of whether
+    /// they are currently enabled. Useful for diagnostics and config
+    /// validation.
+    pub fn all_tool_names() -> Vec<String> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
     }
 }
 
