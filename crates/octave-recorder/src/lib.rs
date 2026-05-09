@@ -15,7 +15,10 @@
 // real-time audio callback is wrapped in such a block (see `audio.rs`).
 // Library consumers don't see this — `cfg(test)` is only true for our own
 // test binary.
-#[cfg(test)]
+// `assert_no_alloc::AllocDisabler` is gated to debug builds in the
+// crate (default features `disable_release` strips it in release).
+// Mirror the gate here so `cargo test --release` compiles.
+#[cfg(all(test, debug_assertions))]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 

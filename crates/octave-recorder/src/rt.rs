@@ -400,6 +400,88 @@ mod tests {
         assert!(FTZ_DAZ_INITIALIZED.with(Cell::get));
     }
 
+    // ---------- assert_no_alloc on the RT path (plan §6.1, §12.4) ----------
+
+    #[test]
+    fn process_input_buffer_does_not_allocate_on_happy_path() {
+        // Pre-allocate everything the call needs OUTSIDE the
+        // assert_no_alloc block, then make exactly one process call
+        // inside it. If process_input_buffer allocates anywhere, the
+        // global AllocDisabler in lib.rs aborts the test.
+        let telemetry = Telemetry::new(2);
+        let (mut producer, _consumer) = build_ring(48_000, 2, 200);
+        let frames: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                let s = if i % 2 == 0 { 0.5 } else { -0.5 };
+                [s, s * 0.5]
+            })
+            .collect();
+
+        assert_no_alloc::assert_no_alloc(|| {
+            process_input_buffer(&frames, 2, &telemetry, &mut producer);
+        });
+    }
+
+    #[test]
+    fn process_input_buffer_does_not_allocate_when_ring_is_full() {
+        let telemetry = Telemetry::new(1);
+        let (mut producer, _consumer) = rtrb::RingBuffer::<f32>::new(64);
+        // Fill the ring outside the assert_no_alloc block.
+        let buf = vec![0.5_f32; 64];
+        process_input_buffer(&buf, 1, &telemetry, &mut producer);
+        assert_eq!(telemetry.dropped_samples.load(Ordering::Relaxed), 0);
+
+        // Now the second push must drop — exercise the dropped-samples
+        // path under assert_no_alloc.
+        assert_no_alloc::assert_no_alloc(|| {
+            process_input_buffer(&buf, 1, &telemetry, &mut producer);
+        });
+        assert_eq!(telemetry.dropped_samples.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn process_input_buffer_does_not_allocate_on_nan_sanitize_path() {
+        // The slow (non-bulk-memcpy) sanitizing copy must also be
+        // allocation-free — this is the path that fires when a driver
+        // emits non-finite floats.
+        let telemetry = Telemetry::new(1);
+        let (mut producer, _consumer) = build_ring(48_000, 1, 200);
+        let buf = [0.5_f32, f32::NAN, 0.25, f32::INFINITY];
+
+        assert_no_alloc::assert_no_alloc(|| {
+            process_input_buffer(&buf, 1, &telemetry, &mut producer);
+        });
+        assert!(telemetry.non_finite_seen.load(Ordering::Acquire));
+    }
+
+    // ---------- partial-frame release behaviour ----------
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn process_input_buffer_partial_frame_release_rounds_down() {
+        // In release, `samples.len() % ch != 0` does NOT panic; the
+        // integer division `n_frames = samples.len() / ch` rounds
+        // down, so the trailing partial frame is silently dropped
+        // from the meter computation but the whole slice still goes
+        // into the ring. Documented in the function header.
+        let telemetry = Telemetry::new(2);
+        let (mut producer, mut consumer) = build_ring(48_000, 2, 200);
+        // 5 samples in a 2-channel buffer = 2.5 frames. Last sample
+        // (index 4) is the partial frame.
+        let buf = [0.1_f32, 0.2, 0.3, 0.4, 0.5];
+        process_input_buffer(&buf, 2, &telemetry, &mut producer);
+
+        // The full 5 samples land in the ring (we don't truncate the
+        // push to whole frames in release).
+        let chunk = consumer.read_chunk(5).unwrap();
+        let (s1, s2) = chunk.as_slices();
+        let mut got = Vec::with_capacity(5);
+        got.extend_from_slice(s1);
+        got.extend_from_slice(s2);
+        chunk.commit_all();
+        assert_eq!(got, vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+    }
+
     #[test]
     fn nan_flag_is_latched_across_buffers() {
         let telemetry = Telemetry::new(1);
