@@ -251,6 +251,16 @@ impl RecordingHandle {
         }
         self.inner.state = RecorderState::Stopping;
 
+        // Pause first so the audio thread stops feeding the ring; otherwise
+        // the writer races a producer that never quits and `stop()` runs
+        // unbounded. Best-effort — if the backend refuses pause, the writer
+        // will still drain whatever's left and finalize.
+        if let Some(stream) = self.inner.stream.as_ref() {
+            if let Err(e) = stream.pause() {
+                tracing::warn!(?e, "cpal pause failed; proceeding with finalize");
+            }
+        }
+
         let writer = self
             .inner
             .writer
@@ -303,6 +313,14 @@ impl RecordingHandle {
             });
         }
         self.inner.state = RecorderState::Cancelling;
+
+        // Pause first to stop new samples — otherwise the writer's cancel
+        // check races a producer that never quits.
+        if let Some(stream) = self.inner.stream.as_ref() {
+            if let Err(e) = stream.pause() {
+                tracing::warn!(?e, "cpal pause failed; proceeding with cancel");
+            }
+        }
 
         let writer = self
             .inner
