@@ -435,7 +435,7 @@ fn start_playback(
             current_session: ps.session_id,
         });
     }
-    let handle = player::open(spec).map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
+    let handle = player::start(spec).map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
     let session_id = Uuid::new_v4();
     let started_at = SystemTime::now();
     let status = handle.status();

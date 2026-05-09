@@ -14,10 +14,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::device::{DeviceError, capabilities_impl, find_device};
 use crate::file_source::{FileSource, OpenFileError};
@@ -44,7 +46,7 @@ fn linear_to_dbfs(x: f32) -> f32 {
     }
 }
 
-/// Errors returned by [`open`].
+/// Errors returned by [`start`].
 #[derive(Debug, Error)]
 pub enum StartError {
     #[error("device not found: {0:?}")]
@@ -53,20 +55,20 @@ pub enum StartError {
     BackendError(String),
     #[error("source unreadable: {0}")]
     SourceUnreadable(String),
-    #[error("file format mismatch — source {source_rate} Hz, device {device_rate} Hz")]
-    RateMismatch { source_rate: u32, device_rate: u32 },
-    #[error("channel mismatch — source {source_channels} ch, device {device_channels} ch")]
-    ChannelMismatch { source_channels: u16, device_channels: u16 },
     #[error("device does not support {requested} Hz; supported: {supported:?}")]
     RateUnsupportedByDevice { requested: u32, supported: Vec<u32> },
     #[error("device does not support {requested} channels; supported: {supported:?}")]
     ChannelsUnsupportedByDevice { requested: u16, supported: Vec<u16> },
     #[error("buffer size {requested} out of range [{min}, {max}]")]
     BufferSizeOutOfRange { requested: u32, min: u32, max: u32 },
+    #[error("device exposes no f32 stream config matching {sample_rate} Hz / {channels} ch")]
+    NoMatchingStreamConfig { sample_rate: u32, channels: u16 },
     #[error("failed to build cpal output stream: {0}")]
     BuildStreamFailed(String),
     #[error("failed to start cpal output stream: {0}")]
     PlayStreamFailed(String),
+    #[error("a playback session is already active: {current_session}")]
+    AlreadyPlaying { current_session: Uuid },
 }
 
 impl From<DeviceError> for StartError {
@@ -114,6 +116,11 @@ pub enum SeekError {
 /// Internal state held by [`PlaybackHandle`]. Not exposed.
 struct Internals {
     state: PlaybackState,
+    /// Session UUID issued by `start`. Held by the session-lock entry
+    /// (see `acquire_session`) and released by `close` / `Drop`. Used
+    /// in `StartError::AlreadyPlaying { current_session }` when a
+    /// second concurrent `start` is attempted.
+    session_id: Uuid,
     sample_rate: u32,
     channels: u16,
     duration_frames: Option<u64>,
@@ -122,7 +129,7 @@ struct Internals {
     /// `!Send` — keep the handle on the thread that built the stream.
     stream: Option<cpal::Stream>,
     reader_join: Option<JoinHandle<()>>,
-    /// Saved at `open()` so [`PlaybackHandle::pause`]'s
+    /// Saved at `start()` so [`PlaybackHandle::pause`]'s
     /// verify-and-rebuild fallback (plan §5.7) can re-construct the
     /// pipeline on backends where `cpal::Stream::pause` silently
     /// no-ops (PipeWire ALSA bridge in particular).
@@ -131,6 +138,54 @@ struct Internals {
     /// dropped the stream + reader and `resume` must rebuild rather
     /// than calling `stream.play`.
     paused_via_drop: bool,
+}
+
+/// Process-global single-session enforcer. Plan §3.7 / §13.3 require
+/// at most one active playback session at a time, with a check at
+/// both the engine and actor layers (defence in depth). The actor
+/// layer's check lives in `octave-mcp::audio_actor`; this is the
+/// engine-layer counterpart.
+fn session_lock() -> &'static Mutex<Option<Uuid>> {
+    static LOCK: OnceLock<Mutex<Option<Uuid>>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(None))
+}
+
+/// Try to claim the global playback slot. Returns the new session UUID
+/// on success, or `AlreadyPlaying { current_session }` when another
+/// session already owns the slot.
+fn acquire_session() -> Result<Uuid, StartError> {
+    let mut guard = session_lock()
+        .lock()
+        .expect("playback session mutex poisoned");
+    if let Some(current) = *guard {
+        return Err(StartError::AlreadyPlaying {
+            current_session: current,
+        });
+    }
+    let id = Uuid::new_v4();
+    *guard = Some(id);
+    Ok(id)
+}
+
+/// Release the global playback slot — called by `close` and by `Drop`
+/// for safety. Idempotent: releasing an already-empty slot is a no-op
+/// (covers Drop-after-close).
+fn release_session(expected: Uuid) {
+    let mut guard = session_lock()
+        .lock()
+        .expect("playback session mutex poisoned");
+    if let Some(current) = *guard {
+        if current == expected {
+            *guard = None;
+        } else {
+            // Different session somehow — don't clobber. Log and bail.
+            tracing::warn!(
+                expected = %expected,
+                current = %current,
+                "release_session: slot owned by a different session; skipping release"
+            );
+        }
+    }
 }
 
 const PAUSE_VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
@@ -162,44 +217,62 @@ pub fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, D
 /// Public entry point: open the output device, load the source, build
 /// and start the cpal output stream, spawn the reader thread. On
 /// success the returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
-pub fn open(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
-    let device = find_device(&spec.device_id)?;
-    let ConstructedSource {
-        source,
-        sample_rate: source_rate,
-        channels: source_channels,
-        duration_frames,
-    } = construct_source(&spec.source)?;
+///
+/// Plan §3.7 / §13.3 single-session enforcement: a process-global
+/// slot is claimed at the top of this call and released by
+/// [`PlaybackHandle::close`] (or its `Drop`). A second concurrent
+/// caller gets [`StartError::AlreadyPlaying { current_session }`].
+pub fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
+    // Claim the slot before spending any I/O / cpal cycles. Released
+    // below on every error path and by close()/Drop on success.
+    let session_id = acquire_session()?;
 
-    validate_source_against_device(&spec.device_id, source_rate, source_channels)?;
-
-    let telemetry = Arc::new(Telemetry::new(source_channels));
-    let signals = Arc::new(TransportSignals::new());
-
-    let (stream, reader_join) = build_running_pipeline(
-        &device,
-        source,
-        source_rate,
-        source_channels,
-        spec.buffer_size,
-        Arc::clone(&telemetry),
-        Arc::clone(&signals),
-    )?;
-
-    Ok(PlaybackHandle {
-        inner: Internals {
-            state: PlaybackState::Playing,
+    // From here on, any early return must release the slot.
+    let result = (|| -> Result<PlaybackHandle, StartError> {
+        let device = find_device(&spec.device_id)?;
+        let ConstructedSource {
+            source,
             sample_rate: source_rate,
             channels: source_channels,
             duration_frames,
-            telemetry,
-            signals,
-            stream: Some(stream),
-            reader_join: Some(reader_join),
-            spec,
-            paused_via_drop: false,
-        },
-    })
+        } = construct_source(&spec.source)?;
+
+        validate_source_against_device(&spec.device_id, source_rate, source_channels)?;
+
+        let telemetry = Arc::new(Telemetry::new(source_channels));
+        let signals = Arc::new(TransportSignals::new());
+
+        let (stream, reader_join) = build_running_pipeline(
+            &device,
+            source,
+            source_rate,
+            source_channels,
+            spec.buffer_size,
+            Arc::clone(&telemetry),
+            Arc::clone(&signals),
+        )?;
+
+        Ok(PlaybackHandle {
+            inner: Internals {
+                state: PlaybackState::Playing,
+                session_id,
+                sample_rate: source_rate,
+                channels: source_channels,
+                duration_frames,
+                telemetry,
+                signals,
+                stream: Some(stream),
+                reader_join: Some(reader_join),
+                spec,
+                paused_via_drop: false,
+            },
+        })
+    })();
+
+    if result.is_err() {
+        release_session(session_id);
+    }
+    result
 }
 
 /// Constructed-source bundle returned by [`construct_source`].
@@ -291,9 +364,9 @@ fn build_running_pipeline(
     let chosen = supported
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == channels)
         .find(|c| c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate)
-        .ok_or(StartError::RateMismatch {
-            source_rate: sample_rate,
-            device_rate: 0,
+        .ok_or(StartError::NoMatchingStreamConfig {
+            sample_rate,
+            channels,
         })?;
 
     if let cpal::SupportedBufferSize::Range { min, max } = chosen.buffer_size() {
@@ -693,6 +766,25 @@ impl PlaybackHandle {
             let _ = h.join();
         }
         self.inner.state = PlaybackState::Closed;
+        // Release the global session slot so the next start() succeeds.
+        release_session(self.inner.session_id);
+    }
+
+    /// Engine-issued session UUID. Same value the
+    /// [`StartError::AlreadyPlaying`] reports when a second
+    /// concurrent caller hits the slot. Surfaced for the MCP layer
+    /// (which currently mints its own; future refactor consolidates).
+    pub fn session_id(&self) -> Uuid {
+        self.inner.session_id
+    }
+}
+
+impl Drop for PlaybackHandle {
+    fn drop(&mut self) {
+        // Safety net for callers that forget close(): release the
+        // session slot. close() also releases — release_session is
+        // idempotent (the second call sees an empty slot and no-ops).
+        release_session(self.inner.session_id);
     }
 }
 

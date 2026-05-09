@@ -631,14 +631,16 @@ pub struct PlaybackLevels {
 |---|---|---|---|---|---|
 | `list_output_devices` | `fn list_output_devices() -> Vec<OutputDeviceInfo>` | — | All enumerable output devices | — | stable |
 | `output_device_capabilities` | `fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, OpenError>` | — | Supported configs | `DeviceNotFound`, `BackendError` | stable |
-| `start` | `fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError>` | spec valid against capabilities; no other session active | Handle in `Playing` state, audio flowing | `DeviceNotFound`, `FormatUnsupported`, `RateMismatch`, `ChannelMismatch`, `SourceUnreadable`, `AlreadyPlaying`, `BackendError` | stable |
+| `start` | `fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError>` | spec valid against capabilities; no other session active | Handle in `Playing` state, audio flowing | `DeviceNotFound`, `BackendError`, `SourceUnreadable`, `RateUnsupportedByDevice`, `ChannelsUnsupportedByDevice`, `BufferSizeOutOfRange`, `NoMatchingStreamConfig`, `BuildStreamFailed`, `PlayStreamFailed`, `AlreadyPlaying` | stable |
 | `pause` | `fn pause(&mut self) -> Result<(), TransportError>` | state == `Playing` | state == `Paused`, audio thread halted | `NotPlaying { current }` | stable |
 | `resume` | `fn resume(&mut self) -> Result<(), TransportError>` | state == `Paused` | state == `Playing`, audio resumes from current position | `NotPaused { current }`, `BuildStreamFailed` (rebuild path) | stable |
 | `stop` | `fn stop(&mut self) -> Result<PlaybackStatus, TransportError>` | state ∈ {`Playing`, `Paused`, `Ended`} | state == `Stopped`, stream dropped | `NotActive { current }` | stable |
 | `seek` | `fn seek(&mut self, frame: u64) -> Result<(), SeekError>` | state ∈ {`Playing`, `Paused`} | position == `frame`, callback resumes from new position | `NotSeekable { current }`, `OutOfBounds { requested, max }` | stable |
 | `position_frames` | `fn position_frames(&self) -> u64` | state ≥ `Playing` | Current frame index | — | stable |
 | `peak_dbfs` | `fn peak_dbfs(&self, channel: u16) -> f32` | state ≥ `Playing` | dBFS of last buffer | — | stable |
+| `peak_take_dbfs` | `fn peak_take_dbfs(&self, channel: u16) -> f32` | state ≥ `Playing` | dBFS of running peak since session start (or last `seek`) | — | stable |
 | `rms_dbfs` | `fn rms_dbfs(&self, channel: u16) -> f32` | state ≥ `Playing` | dBFS of last buffer's RMS | — | stable |
+| `session_id` | `fn session_id(&self) -> Uuid` | — | UUID issued by `start`; matches the value in `AlreadyPlaying { current_session }` | — | stable |
 | `xrun_count` | `fn xrun_count(&self) -> u32` | — | Cumulative under-runs since `start` | — | stable |
 | `state` | `fn state(&self) -> PlaybackState` | — | Current state | — | stable |
 | `status` | `fn status(&self) -> PlaybackStatus` | — | Combined state + position + duration + xruns | — | stable |
@@ -648,13 +650,32 @@ pub struct PlaybackLevels {
 
 ```rust
 pub enum StartError {
-    DeviceNotFound { id: DeviceId },
-    FormatUnsupported { requested: PlaybackSpec, supported: OutputCapabilities },
-    RateMismatch { source_rate: u32, device_rate: u32 },
-    ChannelMismatch { source_channels: u16, device_channels: u16 },
-    SourceUnreadable { reason: String },
-    AlreadyPlaying { current_session: Uuid },
+    DeviceNotFound(DeviceId),
     BackendError(String),
+    SourceUnreadable(String),
+    /// File / buffer source declared a sample rate the device's
+    /// `supported_sample_rates` list doesn't contain.
+    RateUnsupportedByDevice { requested: u32, supported: Vec<u32> },
+    /// File / buffer source declared a channel count the device
+    /// doesn't support.
+    ChannelsUnsupportedByDevice { requested: u16, supported: Vec<u16> },
+    /// Caller asked for `BufferSize::Fixed(n)` outside the device's
+    /// reported [min, max] range.
+    BufferSizeOutOfRange { requested: u32, min: u32, max: u32 },
+    /// Device's `supported_output_configs` has no f32 entry matching
+    /// the source's (sample_rate, channels). Distinct from the per-
+    /// dimension *Unsupported* variants above (those reject before
+    /// we walk the config list).
+    NoMatchingStreamConfig { sample_rate: u32, channels: u16 },
+    /// `cpal::Device::build_output_stream` failed.
+    BuildStreamFailed(String),
+    /// `cpal::Stream::play` failed after build.
+    PlayStreamFailed(String),
+    /// Plan §3.7 / §13.3 single-session enforcement: another
+    /// session already owns the global playback slot. The
+    /// `current_session` field carries that session's UUID so the
+    /// agent can `playback_stop` it before retrying.
+    AlreadyPlaying { current_session: Uuid },
 }
 
 pub enum TransportError {

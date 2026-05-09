@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use octave_player::{
     BufferSize, PlaybackSourceSpec, PlaybackSpec, PlaybackState, list_output_devices,
-    output_device_capabilities, open,
+    output_device_capabilities, start,
 };
 
 fn main() -> ExitCode {
@@ -67,10 +67,10 @@ fn main() -> ExitCode {
         buffer_size: BufferSize::Default,
     };
 
-    let mut handle = match open(spec) {
+    let mut handle = match start(spec) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("open failed: {e}");
+            eprintln!("start failed: {e}");
             return ExitCode::from(4);
         }
     };
