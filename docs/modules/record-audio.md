@@ -585,16 +585,22 @@ pub enum BufferSize { Default, Fixed(u32) }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecorderState {
     Idle,
-    Opening,
+    Opening,    // reserved — open() is synchronous in v0.1, never observed
     Armed,
     Recording,
     Stopping,
     Cancelling,
-    Closed,
-    Errored,
+    Closed,     // reserved — close(self) consumes the handle, so this is never observed via state(); kept for forward-compat with a future drop-in-place teardown that splits the operations
+    Errored,    // reserved — set by the cpal error callback once the surface for that lands; not yet driven from the engine in v0.1
 }
 
-pub struct RecordingHandle { /* opaque */ }
+pub struct RecordingHandle { /* opaque, !Send */ }
+```
+
+> [!NOTE]
+> `RecordingHandle` is `!Send` because `cpal::Stream` is `!Send` on every backend. The handle must be created, used, and dropped on the same OS thread. The MCP layer enforces this via the audio actor (one thread holds the `HashMap<Uuid, RecordingHandle>`); embedders integrating the crate directly must do the same.
+
+```rust
 
 #[derive(Debug, Clone)]
 pub struct RecordedClip {
@@ -620,8 +626,8 @@ pub struct RecordedClip {
 | `open` | `fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError>` | spec valid against capabilities | Handle in `Idle` state | `DeviceNotFound`, `FormatUnsupported`, `BackendError`, `PermissionDenied` | stable |
 | `arm` | `fn arm(&mut self) -> Result<(), ArmError>` | state == `Idle` | state == `Armed`, level meter live | `NotIdle`, `BuildStreamFailed` | stable |
 | `record` | `fn record(&mut self, output_path: &Path) -> Result<(), RecordError>` | state == `Armed` | state == `Recording`, file open, header reserved | `NotArmed`, `OutputPathInvalid`, `PermissionDenied`, `DiskFull` | stable |
-| `stop` | `fn stop(&mut self) -> Result<RecordedClip, StopError>` | state == `Recording` | state == `Armed`, file finalized | `NotRecording`, `FinalizeFailed` | stable |
-| `cancel` | `fn cancel(&mut self) -> Result<(), CancelError>` | state == `Recording` | state == `Armed`, file deleted | `NotRecording` | stable |
+| `stop` | `fn stop(&mut self) -> Result<RecordedClip, StopError>` | state == `Recording` | state == `Idle` (terminal in v0.1; `close()` is the only legal next move — see note below), file finalized | `NotRecording`, `FinalizeFailed` | stable |
+| `cancel` | `fn cancel(&mut self) -> Result<(), CancelError>` | state == `Recording` | state == `Idle` (terminal in v0.1), file deleted | `NotRecording` | stable |
 | `peak_dbfs` | `fn peak_dbfs(&self, channel: u16) -> f32` | state >= `Armed` | dBFS of last buffer for that channel | — | stable |
 | `rms_dbfs` | `fn rms_dbfs(&self, channel: u16) -> f32` | state >= `Armed` | dBFS of last buffer's RMS | — | stable |
 | `xrun_count` | `fn xrun_count(&self) -> u32` | — | Cumulative since `open` | — | stable |
@@ -660,6 +666,9 @@ pub enum CancelError {
     NotRecording { current: RecorderState },
 }
 ```
+
+> [!IMPORTANT]
+> **v0.1: stop / cancel are terminal.** Both transition to `Idle`, not back to `Armed`. The writer thread takes ownership of the SPSC consumer at `record()` time and drops it on finalize; re-arming would need a fresh ring + writer + consumer hand-off back to the handle, which is deferred. After `stop` or `cancel` the only legal next move is `close()` (then `open()` for the next take). The `Stopping → Armed` and `Cancelling → Armed` arrows in §11.3 are the post-v0.1 target — they remain in the diagram so the eventual restructure has somewhere to land.
 
 ### 9.4 Example call (Rust)
 
@@ -729,22 +738,21 @@ Adds: device picker, sample-rate dropdown, buffer-size dropdown, per-channel arm
 
 ### 11.3 Recorder state machine
 
+The diagram below is the **target** state machine. The arrows annotated `(post-v0.1)` are not yet driven by the engine — see §9.1 / §9.2 for the v0.1 implemented subset.
+
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Opening : open()
-  Opening --> Idle : open ok
-  Opening --> Errored : open fail
   Idle --> Armed : arm()
   Armed --> Recording : record(path)
   Recording --> Stopping : stop()
-  Stopping --> Armed : finalize ok
+  Stopping --> Idle : finalize ok (v0.1; Armed is the post-v0.1 target)
   Recording --> Cancelling : cancel()
-  Cancelling --> Armed : delete ok
-  Armed --> Idle : disarm()
+  Cancelling --> Idle : delete ok (v0.1; Armed is the post-v0.1 target)
+  Armed --> Idle : disarm() (post-v0.1)
   Idle --> Closed : close()
   Armed --> Closed : close()
-  Errored --> Closed : close()
+  Errored --> Closed : close() (post-v0.1)
   Closed --> [*]
 ```
 
