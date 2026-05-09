@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+// (AtomicBool used inside Telemetry::non_finite_seen below.)
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -41,6 +42,12 @@ pub(crate) struct Telemetry {
     pub mean_square: Vec<AtomicU32>,
     pub xrun_count: AtomicU32,
     pub dropped_samples: AtomicU64,
+    /// Set once by the RT path the first time a sample arrives that is
+    /// not finite (NaN / Inf). The RT path replaces the offending
+    /// sample with 0.0 in both the meter and the ring; this flag lets
+    /// the writer / UI surface the fact that something downstream of
+    /// the analog input produced bad floats.
+    pub non_finite_seen: AtomicBool,
 }
 
 impl Telemetry {
@@ -52,6 +59,7 @@ impl Telemetry {
             mean_square: (0..n).map(|_| AtomicU32::new(0)).collect(),
             xrun_count: AtomicU32::new(0),
             dropped_samples: AtomicU64::new(0),
+            non_finite_seen: AtomicBool::new(false),
         })
     }
 
