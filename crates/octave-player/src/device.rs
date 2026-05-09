@@ -136,13 +136,22 @@ fn decode_id(s: &str) -> Option<(&str, &str)> {
 }
 
 fn host_id_to_backend(host_id: cpal::HostId) -> Backend {
-    match host_id.name() {
+    let name = host_id.name();
+    match name {
         "ALSA" => Backend::Alsa,
         "JACK" => Backend::Jack,
         "CoreAudio" => Backend::CoreAudio,
         "WASAPI" => Backend::Wasapi,
         "ASIO" => Backend::Asio,
-        _ => Backend::Alsa,
+        // The recorder grew Backend::Other(String) to surface unknown
+        // hosts (commit b58bfec); the player's Backend hasn't yet —
+        // tracked as future-cleanup. Until then log the host so the
+        // mis-tag is visible in the operator's tracing output rather
+        // than silent.
+        unknown => {
+            tracing::warn!(host = unknown, "unknown cpal host name; tagging as Alsa (Backend::Other not yet on player)");
+            Backend::Alsa
+        }
     }
 }
 
