@@ -98,6 +98,11 @@ pub(crate) struct ActiveWriter {
     pub join: JoinHandle<std::io::Result<WriterOutcome>>,
     pub stop: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
+    /// The path the caller asked us to record to. Held here so
+    /// `cancel()` can attempt deletion even if the writer thread
+    /// panicked before producing a `WriterOutcome` — without this
+    /// the partial file would leak silently on writer panic.
+    pub output_path: std::path::PathBuf,
 }
 
 const FLOOR_DBFS: f32 = -180.0;
@@ -270,12 +275,25 @@ impl RecordingHandle {
             });
         }
         let writer = WavWriter::create(output_path, self.inner.sample_rate, self.inner.channels)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    RecordError::PermissionDenied(output_path.to_path_buf())
+            .map_err(|e| {
+                // Log the underlying io::Error before collapsing it
+                // into a RecordError variant — without this the
+                // operator only sees "OutputPathInvalid" with no clue
+                // whether it was NotFound, IsADirectory, or something
+                // else. Plan §8 wants discoverable failure modes.
+                tracing::warn!(
+                    err = %e,
+                    err_kind = ?e.kind(),
+                    path = %output_path.display(),
+                    "WavWriter::create failed"
+                );
+                match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        RecordError::PermissionDenied(output_path.to_path_buf())
+                    }
+                    std::io::ErrorKind::StorageFull => RecordError::DiskFull,
+                    _ => RecordError::OutputPathInvalid(output_path.to_path_buf()),
                 }
-                std::io::ErrorKind::StorageFull => RecordError::DiskFull,
-                _ => RecordError::OutputPathInvalid(output_path.to_path_buf()),
             })?;
 
         let consumer = self.inner.consumer.take().ok_or(RecordError::NotArmed {
@@ -292,7 +310,12 @@ impl RecordingHandle {
         );
 
         self.inner.telemetry.reset_running_peaks();
-        self.inner.writer = Some(ActiveWriter { join, stop, cancel });
+        self.inner.writer = Some(ActiveWriter {
+            join,
+            stop,
+            cancel,
+            output_path: output_path.to_path_buf(),
+        });
         self.inner.started_at = Some(SystemTime::now());
         self.inner.state = RecorderState::Recording;
         Ok(())
@@ -332,7 +355,11 @@ impl RecordingHandle {
             .finalized
             .ok_or_else(|| StopError::FinalizeFailed("writer returned no clip".into()))?;
 
-        let started_at = self.inner.started_at.take().unwrap_or_else(SystemTime::now);
+        let started_at = self
+            .inner
+            .started_at
+            .take()
+            .expect("started_at present in Recording");
         let mut peak_dbfs = Vec::with_capacity(usize::from(self.inner.channels));
         for c in 0..self.inner.channels {
             peak_dbfs.push(linear_to_dbfs(self.inner.telemetry.running_peak_value(c)));
@@ -383,10 +410,40 @@ impl RecordingHandle {
             .take()
             .expect("writer present in Recording");
         writer.cancel.store(true, Ordering::Release);
-        // Best-effort delete; we ignore join / io errors per plan §13.12.
-        if let Ok(Ok(outcome)) = writer.join.join() {
-            if outcome.cancelled {
-                let _ = std::fs::remove_file(&outcome.path);
+
+        // The intent is "remove the partial file the user said they
+        // didn't want". Three failure paths to make sure we ALWAYS
+        // attempt the deletion, not just on the happy join path:
+        //
+        //  - writer.join() returns Err  → thread panicked. Outcome lost.
+        //  - writer.join() returns Ok(Err(io)) → writer hit an io::Error.
+        //  - writer.join() returns Ok(Ok(outcome)) → normal cancel return.
+        //
+        // The original output_path is held in ActiveWriter so we can
+        // remove it even when WriterOutcome is unavailable. We log
+        // the panic / io error via tracing rather than swallowing —
+        // plan §8 wants the user-visible failure modes discoverable.
+        let cancel_path = writer.output_path;
+        match writer.join.join() {
+            Ok(Ok(_outcome)) => {
+                // Normal cancel: the writer already left the file
+                // (or didn't, if cancel beat the open). Best-effort delete.
+                if let Err(e) = std::fs::remove_file(&cancel_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(err = %e, path = %cancel_path.display(),
+                                       "cancel: file delete failed");
+                    }
+                }
+            }
+            Ok(Err(io_err)) => {
+                tracing::warn!(err = %io_err, path = %cancel_path.display(),
+                               "cancel: writer thread returned io error; attempting delete anyway");
+                let _ = std::fs::remove_file(&cancel_path);
+            }
+            Err(panic_payload) => {
+                tracing::warn!(?panic_payload, path = %cancel_path.display(),
+                               "cancel: writer thread panicked; attempting delete anyway");
+                let _ = std::fs::remove_file(&cancel_path);
             }
         }
         self.inner.state = RecorderState::Idle;
