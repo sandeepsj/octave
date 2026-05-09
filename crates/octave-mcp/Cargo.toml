@@ -1,0 +1,31 @@
+[package]
+name        = "octave-mcp"
+version     = "0.1.0"
+description = "MCP server exposing Octave's typed Rust APIs to AI agents over stdio. v0.1: the seven recording_* tools from octave-recorder."
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+octave-recorder    = { workspace = true }
+rmcp               = { workspace = true }
+tokio              = { workspace = true }
+schemars           = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+crossbeam-channel  = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+
+[[bin]]
+name = "octave-mcp"
+path = "src/bin/octave-mcp.rs"
+
+[lints]
+workspace = true
