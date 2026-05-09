@@ -21,6 +21,7 @@
 #![cfg_attr(test, allow(clippy::float_cmp, clippy::cast_precision_loss))]
 
 mod file_source;
+mod reader;
 mod ring;
 mod rt;
 mod signals;
