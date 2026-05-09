@@ -25,9 +25,11 @@ const PARK_DURATION: Duration = Duration::from_millis(2);
 
 #[derive(Debug)]
 pub(crate) struct WriterOutcome {
-    /// `Some` on a clean stop, `None` on cancel.
+    /// `Some` on a clean stop; `None` is the canonical cancel signal —
+    /// the audio.rs cancel path uses `finalized.is_none()` as its
+    /// proof the writer observed the cancel flag and bailed out
+    /// without finalizing.
     pub finalized: Option<FinalizedWav>,
-    pub cancelled: bool,
     pub path: PathBuf,
 }
 
@@ -62,7 +64,6 @@ fn writer_loop(
             drop(writer);
             return Ok(WriterOutcome {
                 finalized: None,
-                cancelled: true,
                 path,
             });
         }
@@ -85,7 +86,6 @@ fn writer_loop(
             let fin = writer.finalize()?;
             return Ok(WriterOutcome {
                 finalized: Some(fin),
-                cancelled: false,
                 path,
             });
         } else {
@@ -128,7 +128,6 @@ mod tests {
         stop.store(true, Ordering::Release);
         let outcome = h.join().expect("writer panicked").expect("writer io error");
 
-        assert!(!outcome.cancelled);
         assert_eq!(outcome.path, path);
         let fin = outcome.finalized.expect("finalized clip on stop");
         assert_eq!(fin.frame_count, 500);
@@ -157,7 +156,8 @@ mod tests {
         cancel.store(true, Ordering::Release);
         let outcome = h.join().expect("writer panicked").expect("writer io error");
 
-        assert!(outcome.cancelled);
+        // Cancel signal: finalized is None (the canonical "writer
+        // observed cancel and bailed without finalizing" proof).
         assert!(outcome.finalized.is_none());
         // File exists but is unfinalized; caller is responsible for deleting.
         assert!(path.exists());

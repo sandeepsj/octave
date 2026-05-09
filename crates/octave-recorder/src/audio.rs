@@ -12,7 +12,6 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-// (AtomicBool used inside Telemetry::non_finite_seen below.)
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -48,11 +47,6 @@ pub(crate) struct Telemetry {
     /// the writer / UI surface the fact that something downstream of
     /// the analog input produced bad floats.
     pub non_finite_seen: AtomicBool,
-    /// Last observed `InputCallbackInfo.timestamp.capture` as
-    /// nanoseconds-since-epoch (cpal's StreamInstant baseline). 0
-    /// means no callback has fired yet. The RT path uses the delta
-    /// against this to detect xrun-style period gaps.
-    pub last_capture_nanos: AtomicU64,
     /// Set by the cpal stream **error callback** when a fatal error
     /// (DeviceNotAvailable) hits the audio thread. The next API call
     /// observing this transitions state to `Errored`.
@@ -69,7 +63,6 @@ impl Telemetry {
             xrun_count: AtomicU32::new(0),
             dropped_samples: AtomicU64::new(0),
             non_finite_seen: AtomicBool::new(false),
-            last_capture_nanos: AtomicU64::new(0),
             errored: AtomicBool::new(false),
         })
     }
@@ -158,27 +151,9 @@ fn detect_xrun_from_capture_timestamp(
     telemetry: &Telemetry,
 ) {
     let cap = info.timestamp().capture;
-    // Encode StreamInstant as u64 nanos relative to its zero-baseline.
-    // We treat it as opaque "seconds * 1e9 + nanos" by formatting into
-    // a Duration-since-zero indirectly; cpal exposes only
-    // `duration_since(other)`, so we reconstruct via a self-relative
-    // probe: compute `cap.duration_since(prev_instant)` only after we
-    // have a prev_instant. For storage we need a u64 encoding —
-    // `Duration::as_nanos()` returns u128. We bound it to u64 by
-    // taking `as u64`; even at 1e9 ns/s, u64 holds ~584 years of
-    // continuous capture, beyond any sane recording session.
-    //
-    // The first callback has no prev to compare to; we store a tiny
-    // sentinel based on `since_first_call` (always-zero on first).
-    // To keep this simple we cache the StreamInstant via
-    // `last_capture_nanos = duration_since(self_zero_anchor) as u64`
-    // — which is just `cap.duration_since(cap_first).as_nanos()`. We
-    // can't directly extract that without owning a "first" instant,
-    // so we settle for the simpler "store a hash of the StreamInstant
-    // as u64 and compare deltas via cpal's duration_since on each
-    // pair". To avoid stashing a non-Copy StreamInstant we approximate:
-    // hold the previous `cap` as a thread_local Option and compute
-    // duration_since on the audio thread.
+    // Previous-capture StreamInstant cached in a thread-local Cell —
+    // cpal::StreamInstant is neither Copy nor Send, so it can't sit
+    // in Telemetry; the audio thread owns the cell exclusively.
     use std::cell::Cell;
     thread_local! {
         static PREV_CAPTURE: Cell<Option<cpal::StreamInstant>> = const { Cell::new(None) };
@@ -204,14 +179,6 @@ fn detect_xrun_from_capture_timestamp(
             }
         }
     }
-
-    // last_capture_nanos kept for future MCP introspection — a u64
-    // monotonic stamp the API can surface in status calls. Best
-    // effort encoding via a self-anchored origin: store a hash that
-    // is monotonically rising for a single thread (we use the ns
-    // gap accumulated since first capture). Skipping the stable
-    // encoding for v0.1 — the AtomicU64 stays for future use.
-    let _ = &telemetry.last_capture_nanos;
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -540,9 +507,18 @@ impl RecordingHandle {
         // plan §8 wants the user-visible failure modes discoverable.
         let cancel_path = writer.output_path;
         match writer.join.join() {
-            Ok(Ok(_outcome)) => {
-                // Normal cancel: the writer already left the file
-                // (or didn't, if cancel beat the open). Best-effort delete.
+            Ok(Ok(outcome)) => {
+                if outcome.finalized.is_some() {
+                    // Race: the writer finalized the file before
+                    // observing the cancel flag (cancel arrived a
+                    // tick after stop's drain completed). The plan
+                    // semantics say "user said no" — we still delete.
+                    tracing::warn!(
+                        path = %cancel_path.display(),
+                        "cancel: writer finalized before observing cancel; deleting anyway"
+                    );
+                }
+                // Best-effort delete; NotFound is fine (cancel beat open).
                 if let Err(e) = std::fs::remove_file(&cancel_path) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(err = %e, path = %cancel_path.display(),
@@ -724,6 +700,9 @@ mod tests {
 
     #[test]
     fn cancel_from_non_recording_returns_not_recording() {
+        // CancelError has only one variant — let-else is cleaner than
+        // a three-arm match (whose `Err(other)` arm would be
+        // unreachable and trip clippy's `unreachable_pattern`).
         for bad_state in [
             RecorderState::Idle,
             RecorderState::Armed,
@@ -731,11 +710,10 @@ mod tests {
             RecorderState::Cancelling,
         ] {
             let mut h = handle_for_test(bad_state, 2, 48_000);
-            match h.cancel() {
-                Err(CancelError::NotRecording { current }) => assert_eq!(current, bad_state),
-                Err(other) => panic!("expected NotRecording for {bad_state:?}, got {other:?}"),
-                Ok(()) => panic!("expected NotRecording for {bad_state:?}, got Ok"),
-            }
+            let Err(CancelError::NotRecording { current }) = h.cancel() else {
+                panic!("expected NotRecording for state {bad_state:?}");
+            };
+            assert_eq!(current, bad_state);
         }
     }
 
