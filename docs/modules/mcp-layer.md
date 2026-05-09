@@ -198,7 +198,7 @@ All tool arguments and returns are derived from typed Rust structs that already 
 | `recording_describe_device` | `DescribeDeviceArgs { device_id: String }` | `Capabilities` |
 | `recording_start` | `StartArgs { device_id, sample_rate, buffer_size, channels, output_path }` | `StartResult { session_id: Uuid, started_at: DateTime<Utc> }` |
 | `recording_stop` | `SessionArgs { session_id: Uuid }` | `RecordedClip` |
-| `recording_cancel` | `SessionArgs { session_id: Uuid }` | `CancelResult { deleted_path: PathBuf }` |
+| `recording_cancel` | `SessionArgs { session_id: Uuid }` | `CancelResult { path: PathBuf, deleted: bool }` |
 | `recording_get_levels` | `SessionArgs { session_id: Uuid }` | `LevelsResult { peak_dbfs: Vec<f32>, rms_dbfs: Vec<f32> }` |
 | `recording_get_status` | `SessionArgs { session_id: Uuid }` | `StatusResult { state, xrun_count, dropped_samples, elapsed_seconds }` |
 
@@ -507,7 +507,7 @@ The seven tools, sourced from [`record-audio`](./record-audio.md) §10 and refin
 | `recording_describe_device` | `{ device_id }` | `Capabilities` | none | "Return supported sample rates, channel counts, and buffer sizes for one device." |
 | `recording_start` | `{ device_id, sample_rate, buffer_size, channels, output_path }` | `{ session_id, started_at }` | **creates a file at `output_path`; overwrites if it exists** | "Open the device, start the audio callback, begin writing 32-bit float WAV to `output_path`. Returns a session_id for subsequent stop/cancel/status calls." |
 | `recording_stop` | `{ session_id }` | `RecordedClip` | finalizes the file | "Stop a recording cleanly. Drains the buffer, finalizes the WAV header, fsyncs, returns the clip metadata." |
-| `recording_cancel` | `{ session_id }` | `{ deleted_path }` | **deletes the partial file** | "Stop a recording and delete the partial file. Use this when the recording is unwanted." |
+| `recording_cancel` | `{ session_id }` | `{ path, deleted }` | **deletes the partial file** | "Stop a recording and delete the partial file. Use this when the recording is unwanted." |
 | `recording_get_levels` | `{ session_id }` | `{ peak_dbfs[], rms_dbfs[] }` | none | "Read the current per-channel peak and RMS levels in dBFS. Safe to poll at meter rates (e.g., 30 Hz)." |
 | `recording_get_status` | `{ session_id }` | `{ state, xrun_count, dropped_samples, elapsed_seconds }` | none | "Return the recorder's current state machine status, plus underrun and drop counts." |
 
@@ -602,7 +602,7 @@ Lightweight; runs in CI; a developer can also `cargo run` and pipe by hand.
 4. **Concurrent session cap.** §6.2 says 8. Confirm against realistic agent flows; could reasonably be higher.
 5. **`recording_start` rolling back partial state on failure.** §5.1 says we close the stream if `record` fails after `open + arm` succeeded. The recorder doesn't expose `unarm` or `disarm`; we'd `close` and lose the stream. Document the semantics: *"start is atomic — succeeds fully or rolls back fully."*
 6. **Streaming levels.** MCP recently added support for tool-result streaming (server-sent events within a tool call). `recording_get_levels` could push instead of poll. Defer; too new to depend on, and polling is fine at 30 Hz.
-7. **Resource cleanup on cancel + delete failure.** If `recording_cancel` succeeds at the recorder layer but `fs::remove_file` fails (permissions, NFS), we currently log and ignore (per record-audio §13.12). Should the tool result indicate a partial outcome? Lean: include `{deleted: bool}` in `CancelResult`.
+7. **Resource cleanup on cancel + delete failure.** **Resolved:** `CancelResult` now ships as `{ path: PathBuf, deleted: bool }`. The agent gets back the path it asked for + a recheck of whether the file is gone. The recorder also logs the underlying I/O error when delete fails (record-audio §13.12), so operators see "why" in the engine's tracing output. §4.2 / §10.1 published shapes updated.
 8. **Authentication for HTTP/SSE.** Out of v0.1 scope, but worth recording: lean OAuth 2.0 device flow when remote transport lands, falling back to `Authorization: Bearer <pre-shared-key>` for headless setups.
 9. **Logging discipline.** All logs go to `stderr`. Lean: `RUST_LOG=info`-controlled `tracing_subscriber` with JSON output when `OCTAVE_LOG_FORMAT=json`, plain text otherwise. The agent's parent process sees `stderr`; in Claude Desktop it's surfaced via the dev tools.
 10. **Tool description copy.** §10.1 has truncated descriptions. The full text needs to be agent-tested — agents are sensitive to subtle phrasings (e.g., the difference between *"writes to disk"* and *"creates a file"* changes whether they prompt the user). I'll iterate on these post-v0.1 as I see real agent transcripts.

@@ -707,7 +707,7 @@ Every stable API operation maps to one MCP tool. The MCP server (separate module
 | `recording_describe_device` | `device_capabilities` | `{ device_id: string }` | `Capabilities` | none | safe |
 | `recording_start` | `open` + `arm` + `record` | `{ device_id, sample_rate, buffer_size, channels, output_path }` | `{ session_id: string, started_at: timestamp }` | creates file | **destructive** if path exists; tool requires user confirmation in default policy |
 | `recording_stop` | `stop` | `{ session_id: string }` | `RecordedClip` | finalizes file | safe |
-| `recording_cancel` | `cancel` | `{ session_id: string }` | `{ deleted_path: string }` | **deletes file** | requires confirmation |
+| `recording_cancel` | `cancel` | `{ session_id: string }` | `{ path: string, deleted: bool }` | **deletes file** | requires confirmation |
 | `recording_get_levels` | `peak_dbfs` + `rms_dbfs` per channel | `{ session_id: string }` | `{ peak_dbfs: number[], rms_dbfs: number[] }` | none | safe; pollable |
 | `recording_get_status` | `state` + `xrun_count` + `dropped_samples` | `{ session_id: string }` | `{ state, xrun_count, dropped_samples, elapsed_seconds }` | none | safe |
 

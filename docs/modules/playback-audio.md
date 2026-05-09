@@ -739,9 +739,9 @@ Every stable API operation maps to one MCP tool. The MCP server lifts these type
 |---|---|---|---|---|---|
 | `playback_list_output_devices` | `list_output_devices` | `{}` | `OutputDeviceInfo[]` | none | safe |
 | `playback_describe_device` | `output_device_capabilities` | `{ device_id: string }` | `OutputCapabilities` | none | safe |
-| `playback_start` | `start` | `{ device_id, source: {kind: "file" \| "buffer", ...}, buffer_size }` | `{ session_id: string, started_at_unix_seconds, duration_seconds: f64? }` | opens device, may read file | safe; `Buffer` source via base64-encoded f32 array, capped to 100 MB |
-| `playback_pause` | `pause` | `{ session_id: string }` | `{ state: "Paused", position_seconds }` | halts audio thread | safe |
-| `playback_resume` | `resume` | `{ session_id: string }` | `{ state: "Playing", position_seconds }` | resumes audio | safe |
+| `playback_start` | `start` | `{ device_id, source: {kind: "file" \| "buffer", ...}, buffer_size }` | `{ session_id, started_at_unix_seconds, duration_seconds: f64?, sample_rate: u32, channels: u16 }` | opens device, may read file | safe; `Buffer` source via base64-encoded f32 array, capped to 100 MB. `sample_rate` + `channels` are echoed back so the agent can interpret subsequent `position_frames` without a second round-trip. |
+| `playback_pause` | `pause` | `{ session_id: string }` | `{ state: "Paused", position_seconds, position_frames }` | halts audio thread | safe; both seconds and frames returned so the agent doesn't need a follow-up `playback_get_status` to do a frame-accurate UI update. |
+| `playback_resume` | `resume` | `{ session_id: string }` | `{ state: "Playing", position_seconds, position_frames }` | resumes audio | safe; same shape as `playback_pause`. |
 | `playback_stop` | `stop` | `{ session_id: string }` | `PlaybackStatus` | drops stream | safe |
 | `playback_seek` | `seek` | `{ session_id: string, position_seconds: f64 }` (frames also accepted as `position_frames: u64`) | `{ position_seconds, position_frames }` | flushes ring | safe |
 | `playback_get_status` | `status` | `{ session_id: string }` | `PlaybackStatus` | none | safe; pollable |
