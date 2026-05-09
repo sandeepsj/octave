@@ -21,6 +21,11 @@ use uuid::Uuid;
 mod error;
 mod state;
 
+// `wav` is wired into `RecordingHandle::record` / `stop` in a follow-up turn;
+// until then its public-by-crate items look dead to the lib build.
+#[allow(dead_code)]
+mod wav;
+
 pub use error::{ArmError, CancelError, OpenError, RecordError, StopError};
 pub use state::RecorderState;
 
