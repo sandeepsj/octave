@@ -36,11 +36,24 @@ use crate::types::{
 const COMMAND_QUEUE: usize = 64;
 const MAX_SESSIONS: usize = 8;
 
-/// Handle held by tool methods. Cheap to clone (`Sender` is `Arc` inside).
+/// Handle held by tool methods. Cheap to clone (the inner `Sender` is
+/// `Arc`-shared inside `crossbeam_channel`); when the last clone
+/// drops, the channel closes and the actor thread is joined.
+///
+/// The `tx` is wrapped in `Option<…>` so `Drop` can `take` it before
+/// joining — Rust drops fields in declaration order *after* the
+/// custom `Drop::drop` returns, which means we can't rely on `tx`'s
+/// natural drop to close the channel before we call `handle.join()`.
+/// Without the `take`, the join would hang forever waiting for a
+/// channel that's still open via `self.tx`.
 #[derive(Clone)]
 pub struct AudioActorHandle {
-    tx: Sender<Command>,
-    _join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    tx: Option<Sender<Command>>,
+    /// Shared join handle. The `Mutex<Option<…>>` lets exactly one
+    /// `Drop` (the last clone) `take` and join the thread; subsequent
+    /// drops see `None` and skip. The `Mutex` is uncontended on the
+    /// happy path — only `Drop` ever touches it.
+    join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl AudioActorHandle {
@@ -50,18 +63,42 @@ impl AudioActorHandle {
             .name("octave-mcp-audio".into())
             .spawn(move || run_actor(rx))?;
         Ok(Self {
-            tx,
-            _join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
+            tx: Some(tx),
+            join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
         })
     }
 
     /// Send a command; non-blocking. Errors if the channel is full or
     /// the actor thread has died.
     pub fn send(&self, cmd: Command) -> Result<(), ActorError> {
-        match self.tx.try_send(cmd) {
+        let tx = self.tx.as_ref().ok_or(ActorError::Gone)?;
+        match tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(ActorError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(ActorError::Gone),
+        }
+    }
+}
+
+impl Drop for AudioActorHandle {
+    fn drop(&mut self) {
+        // Step 1: drop our local Sender clone now (not at end of fn,
+        // when fields drop). This decrements crossbeam's internal
+        // refcount; once all clones do this the actor's `rx.recv()`
+        // returns Err and the run_actor loop exits.
+        let _ = self.tx.take();
+
+        // Step 2: only the LAST AudioActorHandle clone joins the
+        // actor thread. Earlier clones see strong_count > 1 and skip
+        // — the next-to-last clone's Drop will try, and the very
+        // last one will succeed.
+        if std::sync::Arc::strong_count(&self.join) > 1 {
+            return;
+        }
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -194,16 +231,12 @@ struct Session {
     handle: RecordingHandle,
     started_at: SystemTime,
     output_path: PathBuf,
-    #[allow(dead_code)] // recorded for future per-session telemetry
-    sample_rate: u32,
     channels: u16,
 }
 
 struct PlaybackSession {
     handle: PlaybackHandle,
     session_id: Uuid,
-    #[allow(dead_code)] // future per-session telemetry
-    started_at: SystemTime,
 }
 
 #[derive(Default)]
@@ -342,9 +375,12 @@ fn handle_command(cmd: Command, state: &mut ActorState) {
             let result = match state.playback.take() {
                 None => Err(PlaybackSessionError::NotFound(session_id)),
                 Some(ps) if ps.session_id != session_id => {
-                    let other_id = ps.session_id;
+                    // Echo the requested id (matches with_playback_session
+                    // and the recording surface). Don't surface the
+                    // *actual* live session's id — that leaks state to
+                    // a caller who already proved they don't know it.
                     state.playback = Some(ps);
-                    Err(PlaybackSessionError::NotFound(other_id))
+                    Err(PlaybackSessionError::NotFound(session_id))
                 }
                 Some(mut ps) => match ps.handle.stop() {
                     Ok(status) => {
@@ -449,7 +485,6 @@ fn start_playback(
     *playback = Some(PlaybackSession {
         handle,
         session_id,
-        started_at,
     });
     Ok(reply)
 }
@@ -481,7 +516,6 @@ fn start_session(
             handle,
             started_at,
             output_path: output_path.to_path_buf(),
-            sample_rate: spec.sample_rate,
             channels: spec.channels,
         },
     );
@@ -512,7 +546,20 @@ fn clip_to_json(clip: octave_recorder::RecordedClip, started_at: SystemTime) -> 
 fn open_err_str(e: &OpenError) -> String {
     match e {
         OpenError::DeviceNotFound { id: DeviceId(s) } => format!("DeviceNotFound({s})"),
-        OpenError::FormatUnsupported { .. } => "FormatUnsupported".into(),
+        OpenError::FormatUnsupported {
+            requested,
+            supported,
+        } => {
+            // Without these fields the agent has no clue what to retry
+            // with — plan §10.3 makes the error text the wire contract.
+            format!(
+                "FormatUnsupported {{ requested_rate: {}, requested_channels: {}, supported_rates: {:?}, supported_channels: {:?} }}",
+                requested.sample_rate,
+                requested.channels,
+                supported.supported_sample_rates,
+                supported.channels,
+            )
+        }
         OpenError::BackendError(m) => format!("BackendError({m})"),
         OpenError::PermissionDenied => "PermissionDenied".into(),
     }
