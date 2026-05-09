@@ -12,6 +12,7 @@ repository.workspace   = true
 
 [dependencies]
 bytemuck  = { workspace = true }
+rtrb      = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 uuid      = { workspace = true }

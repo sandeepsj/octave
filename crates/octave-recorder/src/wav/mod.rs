@@ -110,6 +110,10 @@ impl WavWriter {
         })
     }
 
+    pub(crate) fn channels(&self) -> u16 {
+        self.channels
+    }
+
     fn audio_byte_count(&self) -> u64 {
         self.frames_written * u64::from(self.channels) * 4
     }
@@ -161,16 +165,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    #[allow(clippy::cast_precision_loss)]
-    fn sine_stereo(frames: usize, sample_rate: u32, freq_hz: f32) -> Vec<f32> {
-        (0..frames)
-            .flat_map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                let s = (2.0 * std::f32::consts::PI * freq_hz * t).sin();
-                [s, -s]
-            })
-            .collect()
-    }
+    use crate::test_support::sine_stereo;
 
     #[test]
     fn round_trip_stereo_through_hound_is_bit_exact() {

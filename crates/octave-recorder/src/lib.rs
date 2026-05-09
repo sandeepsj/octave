@@ -21,10 +21,18 @@ use uuid::Uuid;
 mod error;
 mod state;
 
-// `wav` is wired into `RecordingHandle::record` / `stop` in a follow-up turn;
-// until then its public-by-crate items look dead to the lib build.
+// The recorder's internals — wav writer, ring sizing, writer thread —
+// are wired into `RecordingHandle::record` / `stop` once the audio
+// thread arrives. Until then they look dead to the non-test build.
+#[allow(dead_code)]
+mod ring;
 #[allow(dead_code)]
 mod wav;
+#[allow(dead_code)]
+mod writer;
+
+#[cfg(test)]
+mod test_support;
 
 pub use error::{ArmError, CancelError, OpenError, RecordError, StopError};
 pub use state::RecorderState;
