@@ -11,12 +11,14 @@ homepage.workspace     = true
 repository.workspace   = true
 
 [dependencies]
-bytemuck  = { workspace = true }
-rtrb      = { workspace = true }
-thiserror = { workspace = true }
-tracing   = { workspace = true }
-uuid      = { workspace = true }
-serde     = { workspace = true }
+assert_no_alloc = { workspace = true }
+bytemuck        = { workspace = true }
+cpal            = { workspace = true }
+rtrb            = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+uuid            = { workspace = true }
+serde           = { workspace = true }
 
 [dev-dependencies]
 hound    = { workspace = true }
