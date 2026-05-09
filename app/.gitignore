@@ -10,6 +10,9 @@ vite.config.js
 
 # Tauri (Rust target dir is in workspace target/ already)
 src-tauri/target
+# Generated schemas — tauri-build regenerates them from
+# tauri.conf.json + capabilities/*.json on every cargo build.
+src-tauri/gen
 
 # Editors
 .vscode/*
