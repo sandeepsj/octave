@@ -95,6 +95,21 @@ pub(crate) struct ActiveWriter {
 const FLOOR_DBFS: f32 = -180.0;
 const FLOOR_LINEAR: f32 = 1e-9;
 
+/// Plan §5.5 universal period bounds (independent of device caps).
+/// Below 0.5 ms even modern hosts xrun; above 100 ms latency is too
+/// high to be useful for monitoring.
+const MIN_PERIOD_MS: f32 = 0.5;
+const MAX_PERIOD_MS: f32 = 100.0;
+
+#[allow(clippy::cast_precision_loss)]
+fn period_within_plan_bounds(buffer_size_samples: u32, sample_rate: u32) -> bool {
+    if sample_rate == 0 {
+        return false;
+    }
+    let period_ms = (buffer_size_samples as f32 / sample_rate as f32) * 1000.0;
+    (MIN_PERIOD_MS..=MAX_PERIOD_MS).contains(&period_ms)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn linear_to_dbfs(x: f32) -> f32 {
     if x <= FLOOR_LINEAR {
@@ -144,6 +159,26 @@ pub fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
             requested: Box::new(spec),
             supported: Box::new(caps),
         });
+    }
+
+    // Validate buffer_size:
+    //   1. Against the device's reported [min, max] range (caps).
+    //   2. Against plan §5.5's universal period bounds: 0.5 ms ≤ period ≤ 100 ms.
+    // BufferSize::Default opts out of (1) — we let cpal pick — but we still
+    // reject the rare device whose own caps fall entirely outside §5.5.
+    if let BufferSize::Fixed(n) = spec.buffer_size {
+        if n < caps.min_buffer_size || n > caps.max_buffer_size {
+            return Err(OpenError::FormatUnsupported {
+                requested: Box::new(spec),
+                supported: Box::new(caps),
+            });
+        }
+        if !period_within_plan_bounds(n, spec.sample_rate) {
+            return Err(OpenError::FormatUnsupported {
+                requested: Box::new(spec),
+                supported: Box::new(caps),
+            });
+        }
     }
 
     let stream_config = cpal::StreamConfig {
@@ -399,5 +434,27 @@ mod tests {
             assert_eq!(t.running_peak_value(c), 0.0);
             assert_eq!(t.mean_square_value(c), 0.0);
         }
+    }
+
+    // ---------- §5.5 buffer-size period bounds ----------
+
+    #[test]
+    fn period_bounds_accept_typical_buffer_sizes() {
+        // 64 samples @ 48 kHz = 1.33 ms — well inside [0.5, 100] ms.
+        assert!(period_within_plan_bounds(64, 48_000));
+        // 1024 samples @ 48 kHz = 21.3 ms — top of "monitorable" warn band, still in.
+        assert!(period_within_plan_bounds(1024, 48_000));
+        // 32 samples @ 192 kHz = 0.167 ms — below 0.5 ms floor.
+        assert!(!period_within_plan_bounds(32, 192_000));
+        // 4800 samples @ 48 kHz = 100 ms — at the ceiling, accepted.
+        assert!(period_within_plan_bounds(4800, 48_000));
+        // 4801 samples @ 48 kHz = 100.02 ms — above ceiling.
+        assert!(!period_within_plan_bounds(4801, 48_000));
+    }
+
+    #[test]
+    fn period_bounds_reject_zero_sample_rate() {
+        // Defensive: division by 0 must not panic.
+        assert!(!period_within_plan_bounds(64, 0));
     }
 }
