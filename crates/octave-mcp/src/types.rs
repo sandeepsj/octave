@@ -354,7 +354,6 @@ pub enum PlaybackStateJson {
     Loading,
     Playing,
     Paused,
-    Seeking,
     Stopped,
     Errored,
     Closed,
@@ -389,7 +388,6 @@ impl From<octave_player::PlaybackStatus> for PlaybackStatusJson {
             octave_player::PlaybackState::Loading => (PlaybackStateJson::Loading, None),
             octave_player::PlaybackState::Playing => (PlaybackStateJson::Playing, None),
             octave_player::PlaybackState::Paused => (PlaybackStateJson::Paused, None),
-            octave_player::PlaybackState::Seeking => (PlaybackStateJson::Seeking, None),
             octave_player::PlaybackState::Stopped => {
                 (PlaybackStateJson::Stopped, Some(StoppedReasonJson::User))
             }

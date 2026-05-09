@@ -593,7 +593,11 @@ pub enum PlaybackState {
     Loading,
     Playing,
     Paused,
-    Seeking,
+    // Seeking removed in v0.1: the seek-flush handshake completes
+    // within ~1.3 ms (one period at 48 kHz / 64 buffer) — by the
+    // time any caller polls get_status the state has already
+    // returned to Playing or Paused. If a future seek path runs
+    // long (network sources, on-the-fly resampling), reintroduce.
     Stopped,
     Ended,         // source EOF, distinct from Stopped
     Errored,
@@ -744,6 +748,13 @@ Adds: device picker, sample-rate display (read-only — comes from source), buff
 
 ### 11.3 Player state machine
 
+`seek` does not transition to a separate `Seeking` state in v0.1: the
+flush handshake completes within ~1.3 ms (one period at 48 kHz / 64
+buffer), so any caller polling `get_status` would see Playing → Playing
+or Paused → Paused without ever observing the intermediate. Reintroduce
+when a seek path becomes long-running (network sources, on-the-fly
+resampling).
+
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
@@ -752,10 +763,8 @@ stateDiagram-v2
   Loading --> Errored : load fail
   Playing --> Paused : pause()
   Paused --> Playing : resume()
-  Playing --> Seeking : seek(f)
-  Paused --> Seeking : seek(f)
-  Seeking --> Playing : flush ok and prev was Playing
-  Seeking --> Paused : flush ok and prev was Paused
+  Playing --> Playing : seek(f)
+  Paused --> Paused : seek(f)
   Playing --> Stopped : stop()
   Paused --> Stopped : stop()
   Playing --> Ended : source EOF
