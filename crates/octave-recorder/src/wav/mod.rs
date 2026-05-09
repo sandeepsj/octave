@@ -64,10 +64,20 @@ impl WavWriter {
         channels: u16,
         rf64_threshold_bytes: u64,
     ) -> io::Result<Self> {
-        assert!(
-            (1..=2).contains(&channels),
-            "v0.1 plain header supports 1 or 2 channels; EXTENSIBLE form for ≥3 channels lands next turn",
-        );
+        // v0.1 plain header: RIFF supports ≤ 2 channels; ≥ 3 needs the
+        // EXTENSIBLE form. open() rejects ≥ 3 before reaching this
+        // path; this check is defence-in-depth so a future internal
+        // caller (the writer is pub(crate)) doesn't reintroduce the
+        // panic the previous assert! would have produced.
+        if !(1..=2).contains(&channels) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "v0.1 WAV writer supports 1-2 channels (got {channels}); \
+                     EXTENSIBLE-form header for ≥3 channels not yet implemented"
+                ),
+            ));
+        }
         let mut file = File::create(path)?;
         file.write_all(&build_initial_header(sample_rate, channels))?;
         Ok(Self {
@@ -166,6 +176,28 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::test_support::sine_stereo;
+
+    #[test]
+    fn create_rejects_three_or_more_channels_with_invalid_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("toomany.wav");
+        let err = WavWriter::create(&path, 48_000, 3).err().expect("≥3 channels must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("EXTENSIBLE"),
+            "error mentions the missing EXTENSIBLE form: got {err}",
+        );
+        // No partial file left behind from an early-out before File::create.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn create_rejects_zero_channels_with_invalid_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("zero.wav");
+        let err = WavWriter::create(&path, 48_000, 0).err().expect("0 channels must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn round_trip_stereo_through_hound_is_bit_exact() {

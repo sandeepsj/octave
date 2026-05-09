@@ -145,6 +145,18 @@ pub fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
         });
     }
 
+    // v0.1 WAV writer ships the plain (non-EXTENSIBLE) header, which
+    // RIFF restricts to ≤ 2 channels. Reject ≥ 3 here at the public
+    // entry point — without this, record() reaches WavWriter::create
+    // and panics on a perfectly valid 4-channel device spec. Plan §4.5
+    // EXTENSIBLE form lands when multi-channel is needed.
+    if spec.channels > 2 {
+        return Err(OpenError::FormatUnsupported {
+            requested: Box::new(spec),
+            supported: Box::new(caps),
+        });
+    }
+
     // Pick the f32-format config that matches the requested rate + channels.
     let supported = device
         .supported_input_configs()
