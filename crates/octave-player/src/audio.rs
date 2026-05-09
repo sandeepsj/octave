@@ -788,3 +788,230 @@ impl Drop for PlaybackHandle {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test-only constructor — build a `PlaybackHandle` in an
+    /// arbitrary state without actually opening a cpal device. Used
+    /// to exercise the read-only / state-error paths that don't
+    /// touch the audio pipeline.
+    fn handle_for_test(state: PlaybackState, channels: u16, sample_rate: u32) -> PlaybackHandle {
+        // Don't go through acquire_session (we'd contend with parallel
+        // tests); mint a UUID directly. The Drop impl will call
+        // release_session, which idempotently no-ops on an empty slot.
+        let signals = Arc::new(TransportSignals::new());
+        let telemetry = Arc::new(Telemetry::new(channels));
+        PlaybackHandle {
+            inner: Internals {
+                state,
+                session_id: Uuid::new_v4(),
+                sample_rate,
+                channels,
+                duration_frames: Some(48_000),
+                telemetry,
+                signals,
+                stream: None,
+                reader_join: None,
+                spec: PlaybackSpec {
+                    device_id: DeviceId("ALSA:test".into()),
+                    source: PlaybackSourceSpec::Buffer {
+                        samples: Arc::from(vec![0.0_f32; (channels as usize) * 4]),
+                        sample_rate,
+                        channels,
+                    },
+                    buffer_size: BufferSize::Default,
+                },
+                paused_via_drop: false,
+            },
+        }
+    }
+
+    // ---------- linear_to_dbfs ----------
+
+    #[test]
+    fn linear_to_dbfs_floor_clamps_zero_and_subnormal_to_minus_180() {
+        assert_eq!(linear_to_dbfs(0.0), FLOOR_DBFS);
+        assert_eq!(linear_to_dbfs(FLOOR_LINEAR / 2.0), FLOOR_DBFS);
+    }
+
+    #[test]
+    fn linear_to_dbfs_unity_is_zero() {
+        assert!((linear_to_dbfs(1.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn linear_to_dbfs_half_is_minus_six() {
+        // 20 * log10(0.5) ≈ -6.0206
+        assert!((linear_to_dbfs(0.5) - (-6.0)).abs() < 0.05);
+    }
+
+    // ---------- per-channel level accessors ----------
+
+    #[test]
+    fn peak_dbfs_out_of_range_channel_returns_neg_infinity() {
+        let h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        assert_eq!(h.peak_dbfs(0), FLOOR_DBFS); // valid channel, no audio
+        assert_eq!(h.peak_dbfs(1), FLOOR_DBFS);
+        assert_eq!(h.peak_dbfs(2), f32::NEG_INFINITY); // ch >= channels
+        assert_eq!(h.peak_dbfs(99), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn rms_dbfs_out_of_range_channel_returns_neg_infinity() {
+        let h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        assert_eq!(h.rms_dbfs(2), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn peak_take_dbfs_out_of_range_channel_returns_neg_infinity() {
+        let h = handle_for_test(PlaybackState::Playing, 1, 48_000);
+        assert_eq!(h.peak_take_dbfs(1), f32::NEG_INFINITY);
+    }
+
+    // ---------- lazy Playing → Ended transition ----------
+
+    #[test]
+    fn state_lazily_reports_ended_when_playback_complete_is_set() {
+        let h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        assert_eq!(h.state(), PlaybackState::Playing);
+        // Audio thread (simulated) signals EOF + drained.
+        h.inner
+            .signals
+            .playback_complete
+            .store(true, Ordering::Release);
+        assert_eq!(h.state(), PlaybackState::Ended);
+    }
+
+    #[test]
+    fn state_does_not_promote_to_ended_from_paused() {
+        // playback_complete should only flip Playing → Ended; from
+        // Paused (or any other state) the inner state wins.
+        let h = handle_for_test(PlaybackState::Paused, 2, 48_000);
+        h.inner
+            .signals
+            .playback_complete
+            .store(true, Ordering::Release);
+        assert_eq!(h.state(), PlaybackState::Paused);
+    }
+
+    #[test]
+    fn status_carries_lazy_ended_transition() {
+        let h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        h.inner
+            .signals
+            .playback_complete
+            .store(true, Ordering::Release);
+        let s = h.status();
+        assert_eq!(s.state, PlaybackState::Ended);
+    }
+
+    // ---------- seek state-error paths ----------
+
+    #[test]
+    fn seek_returns_not_seekable_in_terminal_states() {
+        for bad_state in [
+            PlaybackState::Idle,
+            PlaybackState::Stopped,
+            PlaybackState::Errored,
+            PlaybackState::Closed,
+            PlaybackState::Loading,
+        ] {
+            let mut h = handle_for_test(bad_state, 2, 48_000);
+            let Err(SeekError::NotSeekable { current }) = h.seek(0) else {
+                panic!("expected NotSeekable for state {bad_state:?}");
+            };
+            assert_eq!(current, bad_state);
+        }
+    }
+
+    #[test]
+    fn seek_returns_out_of_bounds_when_frame_exceeds_duration() {
+        // handle_for_test sets duration_frames = Some(48_000).
+        let mut h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        let Err(SeekError::OutOfBounds { requested, max }) = h.seek(48_001) else {
+            panic!("expected OutOfBounds for frame > duration");
+        };
+        assert_eq!(requested, 48_001);
+        assert_eq!(max, 48_000);
+    }
+
+    #[test]
+    fn seek_to_exact_duration_is_allowed() {
+        let mut h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        // duration is 48_000; seek to 48_000 (one-past-end → EOF) is OK.
+        h.seek(48_000).expect("seek to duration is allowed");
+    }
+
+    #[test]
+    fn seek_resets_running_peaks() {
+        let h = handle_for_test(PlaybackState::Playing, 1, 48_000);
+        // Pre-load a running peak as if the audio thread had recorded it.
+        h.inner.telemetry.running_peak[0].store(0.5_f32.to_bits(), Ordering::Relaxed);
+        assert!((h.inner.telemetry.running_peak_value(0) - 0.5).abs() < 1e-6);
+
+        let mut h = h;
+        h.seek(0).expect("valid seek");
+        assert_eq!(h.inner.telemetry.running_peak_value(0), 0.0);
+    }
+
+    // ---------- close() idempotency / lazy state ----------
+
+    #[test]
+    fn close_after_natural_end_does_not_panic() {
+        // Ensures close() takes the lazy state() path (Ended) rather
+        // than calling stop() on a finished stream. We can't directly
+        // observe whether stop ran without a real cpal device, but we
+        // verify it doesn't panic and post-state is Closed semantics
+        // (handle is consumed, no double-release on the global slot).
+        // We deliberately do NOT touch acquire_session here so the
+        // test doesn't race the session_lock test.
+        let h = handle_for_test(PlaybackState::Playing, 2, 48_000);
+        h.inner
+            .signals
+            .playback_complete
+            .store(true, Ordering::Release);
+        h.close();
+    }
+
+    // ---------- session lock semantics ----------
+    //
+    // The session lock is process-global, so tests that touch it
+    // can race under cargo's default parallel runner. Merged into
+    // one sequential test (with a serializing Mutex inside) so the
+    // assertions stay deterministic without `--test-threads=1` or
+    // adding the serial_test dep.
+    #[test]
+    fn session_lock_semantics_acquire_block_release_reuse() {
+        // Serialize against any other accidental session_lock test.
+        use std::sync::Mutex;
+        static SERIALIZE: Mutex<()> = Mutex::new(());
+        let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 1. First acquire wins.
+        let first = acquire_session().expect("first acquire wins");
+
+        // 2. Second acquire blocks with AlreadyPlaying { current_session: first }.
+        let err = acquire_session().expect_err("second acquire blocks");
+        match err {
+            StartError::AlreadyPlaying { current_session } => {
+                assert_eq!(current_session, first);
+            }
+            other => panic!("expected AlreadyPlaying, got {other:?}"),
+        }
+
+        // 3. Imposter release does not clobber the slot.
+        let imposter = Uuid::new_v4();
+        release_session(imposter); // warn + skip
+        let still_blocked = acquire_session().expect_err("slot still owned by `first`");
+        assert!(matches!(still_blocked, StartError::AlreadyPlaying { .. }));
+
+        // 4. Owner release frees the slot.
+        release_session(first);
+
+        // 5. Next acquire succeeds.
+        let second = acquire_session().expect("slot free after owner release");
+        release_session(second);
+    }
+}
+
