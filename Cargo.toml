@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/octave-recorder",
+]
+
+[workspace.package]
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+authors      = ["Sandeep SJ <sandeepsj0000@gmail.com>"]
+homepage     = "https://github.com/sandeepsj/octave"
+repository   = "https://github.com/sandeepsj/octave"
+
+[workspace.dependencies]
+cpal            = "0.15"
+rtrb            = "0.3"
+assert_no_alloc = "1.1"
+thiserror       = "2"
+tracing         = "0.1"
+uuid            = { version = "1", features = ["v4", "serde"] }
+serde           = { version = "1", features = ["derive"] }
+
+[workspace.lints.clippy]
+float_cmp                = "warn"
+lossy_float_literal      = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap       = "warn"
+cast_precision_loss      = "warn"
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+debug         = false
+panic         = "abort"
+strip         = "symbols"
+
+[profile.dev]
+debug-assertions = true
+overflow-checks  = true
