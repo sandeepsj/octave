@@ -192,7 +192,7 @@ mod tests {
         let telemetry = Telemetry::new(2);
         let signals = TransportSignals::new();
         let (_p, mut c) = build_ring(48_000, 2, 200);
-        process_output_buffer(&mut [], 2, &telemetry, &mut c, &TransportSignals::new());
+        process_output_buffer(&mut [], 2, &telemetry, &mut c, &signals);
         assert_eq!(telemetry.peak_value(0), 0.0);
         assert_eq!(telemetry.position_frames.load(Ordering::Relaxed), 0);
         assert_eq!(telemetry.xrun_count.load(Ordering::Relaxed), 0);

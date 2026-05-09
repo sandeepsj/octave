@@ -833,8 +833,14 @@ dependencies = [
 name = "octave-player"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
+ "cpal",
+ "hound",
+ "rtrb",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "uuid",
 ]
 

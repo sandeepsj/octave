@@ -398,7 +398,8 @@ mod tests {
     fn spawn_reader_drains_source_and_exits_on_stop() {
         let src = Box::new(ramp_source(100, 48_000));
         let signals = Arc::new(TransportSignals::new());
-        let (p, mut c) = build_ring(48_000, 2, 200);
+        let (p, c) = build_ring(48_000, 2, 200);
+        let _ = c; // we don't drain in this test; just hold the consumer alive
 
         let h = spawn_reader(src, p, Arc::clone(&signals));
 

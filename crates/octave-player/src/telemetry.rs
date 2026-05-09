@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// Per-session shared atomic state. Constructed once on `start`,
 /// referenced by both the audio callback and the handle.
 pub(crate) struct Telemetry {
+    #[allow(dead_code)] // surfaced once running-peak-per-take is wired through the API
     pub channels: u16,
 
     // ---- meter (one slot per channel) ----
@@ -59,6 +60,7 @@ impl Telemetry {
     }
 
     /// Take-so-far peak as a linear value in `[0, 1]`.
+    #[allow(dead_code)] // surfaced via PlaybackHandle once take-peak reporting lands
     pub fn running_peak_value(&self, channel: u16) -> f32 {
         let i = usize::from(channel);
         f32::from_bits(self.running_peak[i].load(Ordering::Relaxed))
@@ -66,6 +68,7 @@ impl Telemetry {
 
     /// Reset per-take running peaks. Called on `start` (and on `seek`
     /// to provide a fresh peak for the new region).
+    #[allow(dead_code)] // wired in once running-peak reset on seek lands
     pub fn reset_running_peaks(&self) {
         for ap in &self.running_peak {
             ap.store(0u32, Ordering::Relaxed);

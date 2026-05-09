@@ -64,6 +64,7 @@ impl TransportSignals {
     }
 
     /// API → reader: kick off a seek to `frame`.
+    #[allow(dead_code)] // wired when PlaybackHandle::seek lands
     pub fn request_seek(&self, frame: u64) {
         self.seek_target.store(frame, Ordering::Release);
         self.seek_pending.store(true, Ordering::Release);
