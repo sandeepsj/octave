@@ -109,12 +109,16 @@ pub(crate) fn process_output_buffer(
         }
     }
 
-    // Silence the remainder of `out`, count the under-run.
+    // Silence the remainder of `out`. Count the under-run as an xrun
+    // only if we're still in normal playback — after EOF the silence
+    // is the natural tail of the source, not starvation.
     if take_samples < want {
         for slot in &mut out[take_samples..] {
             *slot = 0.0;
         }
-        telemetry.xrun_count.fetch_add(1, Ordering::Relaxed);
+        if !signals.eof_seen.load(Ordering::Acquire) {
+            telemetry.xrun_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // ---------- meter: stack-only ----------

@@ -258,9 +258,16 @@ pub fn open(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
         )
         .map_err(|e| StartError::BuildStreamFailed(e.to_string()))?;
 
-    // Spawn the reader before starting the stream so the ring has
-    // some pre-roll before the device starts pulling.
+    // Spawn the reader, then give it a brief head start to prime the
+    // ring before the device starts pulling. Without this, the very
+    // first cpal callback fires against an empty ring and emits one
+    // period of silence + 1 xrun. 50 ms is well above the reader's
+    // first-push latency (READ_BLOCK = 4096 frames ≈ 85 ms of audio
+    // pushed in well under 1 ms of wall-clock work) on every backend
+    // we target. Cost: 50 ms of start latency, comfortably under the
+    // §6.2 100 ms budget.
     let reader_join = spawn_reader(source, producer, Arc::clone(&signals));
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     stream
         .play()
