@@ -455,6 +455,11 @@ impl PlaybackHandle {
                 return Err(SeekError::OutOfBounds { requested: frame, max: dur });
             }
         }
+        // Reset the per-take running peak so the meter doesn't carry
+        // a clip from before the seek point into the new region —
+        // plan §5.8 / glossary describe a fresh per-region peak.
+        // Non-RT thread; allocation-safe.
+        self.inner.telemetry.reset_running_peaks();
         self.inner.signals.request_seek(frame);
         Ok(())
     }
@@ -581,6 +586,17 @@ impl PlaybackHandle {
         }
         let ms = self.inner.telemetry.mean_square_value(channel);
         linear_to_dbfs(ms.sqrt())
+    }
+
+    /// Per-channel running peak (max abs since the last seek or take
+    /// start) in dBFS. The recorder's analogue is `RecordedClip.peak_dbfs`;
+    /// for playback the take-peak surfaces live so the UI can show
+    /// "loudest sample heard so far". Reset by `seek`.
+    pub fn peak_take_dbfs(&self, channel: u16) -> f32 {
+        if channel >= self.inner.channels {
+            return f32::NEG_INFINITY;
+        }
+        linear_to_dbfs(self.inner.telemetry.running_peak_value(channel))
     }
 
     /// All-channel levels in one snapshot.
