@@ -23,6 +23,7 @@
 mod file_source;
 mod ring;
 mod rt;
+mod signals;
 mod source;
 mod telemetry;
 mod wav;
