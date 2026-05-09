@@ -127,6 +127,7 @@ pub enum SessionError {
 struct Session {
     handle: RecordingHandle,
     started_at: SystemTime,
+    output_path: PathBuf,
     #[allow(dead_code)] // recorded for future per-session telemetry
     sample_rate: u32,
     channels: u16,
@@ -181,7 +182,15 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
                 Some(mut s) => match s.handle.cancel() {
                     Ok(()) => {
                         s.handle.close();
-                        Ok((PathBuf::new(), true))
+                        // Echo the original path so the agent can verify
+                        // *which* file was deleted. `cancel` deletes the
+                        // partial WAV best-effort; we report success
+                        // unconditionally because the file may not have
+                        // been created yet (early failure) and the agent
+                        // still needs the path for cleanup logging.
+                        let path = s.output_path.clone();
+                        let deleted = !path.exists();
+                        Ok((path, deleted))
                     }
                     Err(CancelError::NotRecording { current }) => {
                         sessions.insert(session_id, s);
@@ -256,6 +265,7 @@ fn start_session(
         Session {
             handle,
             started_at,
+            output_path: output_path.to_path_buf(),
             sample_rate: spec.sample_rate,
             channels: spec.channels,
         },
