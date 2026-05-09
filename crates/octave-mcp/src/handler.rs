@@ -110,10 +110,7 @@ impl OctaveServer {
         let id = octave_recorder::DeviceId(device_id);
         match octave_recorder::device_capabilities(&id) {
             Ok(c) => Ok(Json(c.into())),
-            Err(e) => Err(ErrorData::invalid_params(
-                format!("OpenError::{e:?}"),
-                None,
-            )),
+            Err(e) => Err(ErrorData::invalid_params(format_typed_error("OpenError", &e), None)),
         }
     }
 
@@ -312,7 +309,10 @@ impl OctaveServer {
         let id = octave_player::DeviceId(device_id);
         match octave_player::output_device_capabilities(&id) {
             Ok(c) => Ok(Json(c.into())),
-            Err(e) => Err(ErrorData::invalid_params(format!("DeviceError::{e}"), None)),
+            Err(e) => Err(ErrorData::invalid_params(
+                format_typed_error("DeviceError", &e),
+                None,
+            )),
         }
     }
 
@@ -581,4 +581,17 @@ fn parse_session_id(s: &str) -> Result<Uuid, ErrorData> {
     Uuid::parse_str(s).map_err(|_| {
         ErrorData::invalid_params(format!("invalid session_id: {s} is not a UUID"), None)
     })
+}
+
+/// Format an error enum variant as `EnumName::DebugBody` per
+/// mcp-layer plan §10.3 wire-contract format. Uses Debug so the
+/// variant name + structured fields land verbatim — agents pattern-
+/// match on the variant prefix to recover from typed failures.
+///
+/// Used by every site in this module that converts a typed engine
+/// error into the JSON-RPC `error.message` string. Centralised so
+/// the format stays uniform: a future change here updates every
+/// tool's error envelope at once.
+fn format_typed_error<E: std::fmt::Debug>(prefix: &str, err: &E) -> String {
+    format!("{prefix}::{err:?}")
 }
