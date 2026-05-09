@@ -11,6 +11,7 @@ homepage.workspace     = true
 repository.workspace   = true
 
 [dependencies]
+rtrb      = { workspace = true }
 serde     = { workspace = true }
 thiserror = { workspace = true }
 uuid      = { workspace = true }
