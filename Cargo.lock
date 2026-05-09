@@ -817,6 +817,7 @@ name = "octave-mcp"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "octave-player",
  "octave-recorder",
  "rmcp",
  "schemars",

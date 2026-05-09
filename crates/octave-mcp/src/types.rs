@@ -131,6 +131,15 @@ impl From<BufferSizeJson> for BufferSize {
     }
 }
 
+impl From<BufferSizeJson> for octave_player::BufferSize {
+    fn from(b: BufferSizeJson) -> Self {
+        match b {
+            BufferSizeJson::Default => octave_player::BufferSize::Default,
+            BufferSizeJson::Fixed { samples } => octave_player::BufferSize::Fixed(samples),
+        }
+    }
+}
+
 /// Argument to `recording_start`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StartArgs {
@@ -232,4 +241,190 @@ impl From<RecorderState> for RecorderStateJson {
             RecorderState::Errored => Self::Errored,
         }
     }
+}
+
+// ============================================================================
+//   Playback wire types — mirror of the recording set, for `playback_*` tools.
+// ============================================================================
+
+/// Result of `playback_list_output_devices`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ListOutputDevicesResult {
+    pub devices: Vec<OutputDeviceInfoJson>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct OutputDeviceInfoJson {
+    pub device_id: String,
+    pub name: String,
+    pub backend: BackendJson,
+    pub is_default_output: bool,
+    pub max_output_channels: u16,
+}
+
+impl From<octave_player::OutputDeviceInfo> for OutputDeviceInfoJson {
+    fn from(d: octave_player::OutputDeviceInfo) -> Self {
+        Self {
+            device_id: d.id.0,
+            name: d.name,
+            backend: player_backend(d.backend),
+            is_default_output: d.is_default_output,
+            max_output_channels: d.max_output_channels,
+        }
+    }
+}
+
+fn player_backend(b: octave_player::Backend) -> BackendJson {
+    match b {
+        octave_player::Backend::Alsa => BackendJson::Alsa,
+        octave_player::Backend::PipeWire => BackendJson::PipeWire,
+        octave_player::Backend::Jack => BackendJson::Jack,
+        octave_player::Backend::CoreAudio => BackendJson::CoreAudio,
+        octave_player::Backend::Wasapi => BackendJson::Wasapi,
+        octave_player::Backend::Asio => BackendJson::Asio,
+    }
+}
+
+impl From<octave_player::OutputCapabilities> for CapabilitiesJson {
+    fn from(c: octave_player::OutputCapabilities) -> Self {
+        Self {
+            min_sample_rate: c.min_sample_rate,
+            max_sample_rate: c.max_sample_rate,
+            supported_sample_rates: c.supported_sample_rates,
+            min_buffer_size: c.min_buffer_size,
+            max_buffer_size: c.max_buffer_size,
+            channels: c.channels,
+            default_sample_rate: c.default_sample_rate,
+            default_buffer_size: c.default_buffer_size,
+        }
+    }
+}
+
+/// Source descriptor for `playback_start`. v0.1 supports `file` (path on
+/// disk to a 32-bit float WAV / RF64) and `buffer` (inline f32 array,
+/// capped at 100 MB by the MCP layer to avoid pathological JSON-RPC
+/// payloads — agents wanting larger should write a temp file first).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybackSourceJson {
+    File {
+        path: PathBuf,
+    },
+    Buffer {
+        /// Interleaved 32-bit float samples, channel-major within each
+        /// frame. Length must be a multiple of `channels`.
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+    },
+}
+
+/// Argument to `playback_start`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlaybackStartArgs {
+    pub device_id: String,
+    pub source: PlaybackSourceJson,
+    pub buffer_size: BufferSizeJson,
+}
+
+/// Result of `playback_start`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlaybackStartResult {
+    pub session_id: String,
+    pub started_at_unix_seconds: u64,
+    /// Total source duration in seconds, when known. `None` for unbounded
+    /// sources (none in v0.1, but reserved for future streaming sources).
+    pub duration_seconds: Option<f64>,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Wire form of [`octave_player::PlaybackState`]. `Ended` is collapsed
+/// into `Stopped` with a `reason: "eof"` field per resolved §13.6.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackStateJson {
+    Idle,
+    Loading,
+    Playing,
+    Paused,
+    Seeking,
+    Stopped,
+    Errored,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StoppedReasonJson {
+    User,
+    Eof,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlaybackStatusJson {
+    pub state: PlaybackStateJson,
+    /// Set when `state == "stopped"`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<StoppedReasonJson>,
+    pub position_frames: u64,
+    pub position_seconds: f64,
+    pub duration_frames: Option<u64>,
+    pub duration_seconds: Option<f64>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub xrun_count: u32,
+}
+
+impl From<octave_player::PlaybackStatus> for PlaybackStatusJson {
+    fn from(s: octave_player::PlaybackStatus) -> Self {
+        let (state, stopped_reason) = match s.state {
+            octave_player::PlaybackState::Idle => (PlaybackStateJson::Idle, None),
+            octave_player::PlaybackState::Loading => (PlaybackStateJson::Loading, None),
+            octave_player::PlaybackState::Playing => (PlaybackStateJson::Playing, None),
+            octave_player::PlaybackState::Paused => (PlaybackStateJson::Paused, None),
+            octave_player::PlaybackState::Seeking => (PlaybackStateJson::Seeking, None),
+            octave_player::PlaybackState::Stopped => {
+                (PlaybackStateJson::Stopped, Some(StoppedReasonJson::User))
+            }
+            octave_player::PlaybackState::Ended => {
+                (PlaybackStateJson::Stopped, Some(StoppedReasonJson::Eof))
+            }
+            octave_player::PlaybackState::Errored => (PlaybackStateJson::Errored, None),
+            octave_player::PlaybackState::Closed => (PlaybackStateJson::Closed, None),
+        };
+        Self {
+            state,
+            stopped_reason,
+            position_frames: s.position_frames,
+            position_seconds: s.position_seconds,
+            duration_frames: s.duration_frames,
+            duration_seconds: s.duration_seconds,
+            sample_rate: s.sample_rate,
+            channels: s.channels,
+            xrun_count: s.xrun_count,
+        }
+    }
+}
+
+/// Argument to `playback_seek`. One of `position_seconds` /
+/// `position_frames` is required; if both are given, frames win.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlaybackSeekArgs {
+    pub session_id: String,
+    pub position_seconds: Option<f64>,
+    pub position_frames: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlaybackSeekResult {
+    pub position_seconds: f64,
+    pub position_frames: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlaybackTransportResult {
+    pub state: PlaybackStateJson,
+    pub position_seconds: f64,
+    pub position_frames: u64,
 }

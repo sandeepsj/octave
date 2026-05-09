@@ -24,7 +24,14 @@ use octave_recorder::{
     RecordingSpec, StopError,
 };
 
-use crate::types::{LevelsResult, RecordedClipJson, RecorderStateJson, StatusResult};
+use octave_player::{
+    self as player, PlaybackHandle, PlaybackSpec,
+};
+
+use crate::types::{
+    LevelsResult, PlaybackSeekResult, PlaybackStatusJson, PlaybackTransportResult,
+    RecordedClipJson, RecorderStateJson, StatusResult,
+};
 
 const COMMAND_QUEUE: usize = 64;
 const MAX_SESSIONS: usize = 8;
@@ -72,6 +79,7 @@ pub enum ActorError {
 
 /// Commands the actor accepts. Each carries a oneshot to reply on.
 pub enum Command {
+    // ---------- recording ----------
     /// Open + Arm + Record collapsed into one atomic step (rolls back on failure).
     StartRecording {
         spec: RecordingSpec,
@@ -93,6 +101,37 @@ pub enum Command {
     GetStatus {
         session_id: Uuid,
         reply: oneshot::Sender<Result<StatusResult, SessionError>>,
+    },
+
+    // ---------- playback ----------
+    PlaybackStart {
+        spec: PlaybackSpec,
+        reply: oneshot::Sender<Result<PlaybackStartReply, PlaybackStartError>>,
+    },
+    PlaybackPause {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<PlaybackTransportResult, PlaybackSessionError>>,
+    },
+    PlaybackResume {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<PlaybackTransportResult, PlaybackSessionError>>,
+    },
+    PlaybackStop {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<PlaybackStatusJson, PlaybackSessionError>>,
+    },
+    PlaybackSeek {
+        session_id: Uuid,
+        target_frames: u64,
+        reply: oneshot::Sender<Result<PlaybackSeekResult, PlaybackSessionError>>,
+    },
+    PlaybackGetStatus {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<PlaybackStatusJson, PlaybackSessionError>>,
+    },
+    PlaybackGetLevels {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<LevelsResult, PlaybackSessionError>>,
     },
 }
 
@@ -124,6 +163,33 @@ pub enum SessionError {
     Cancel(String),
 }
 
+#[derive(Debug)]
+pub struct PlaybackStartReply {
+    pub session_id: Uuid,
+    pub started_at: SystemTime,
+    pub duration_seconds: Option<f64>,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlaybackStartError {
+    #[error("StartError::{0}")]
+    Start(String),
+    #[error("a playback session is already active: {current_session}")]
+    AlreadyPlaying { current_session: Uuid },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlaybackSessionError {
+    #[error("session_not_found: {0}")]
+    NotFound(Uuid),
+    #[error("transport: {0}")]
+    Transport(String),
+    #[error("seek: {0}")]
+    Seek(String),
+}
+
 struct Session {
     handle: RecordingHandle,
     started_at: SystemTime,
@@ -133,30 +199,46 @@ struct Session {
     channels: u16,
 }
 
+struct PlaybackSession {
+    handle: PlaybackHandle,
+    session_id: Uuid,
+    #[allow(dead_code)] // future per-session telemetry
+    started_at: SystemTime,
+}
+
+#[derive(Default)]
+struct ActorState {
+    recording: HashMap<Uuid, Session>,
+    playback: Option<PlaybackSession>,
+}
+
 fn run_actor(rx: Receiver<Command>) {
-    let mut sessions: HashMap<Uuid, Session> = HashMap::new();
+    let mut state = ActorState::default();
     while let Ok(cmd) = rx.recv() {
-        handle_command(cmd, &mut sessions);
+        handle_command(cmd, &mut state);
     }
     // Channel closed → drain and close everything.
-    for (_, mut s) in sessions.drain() {
+    for (_, mut s) in state.recording.drain() {
         let _ = s.handle.cancel();
         s.handle.close();
+    }
+    if let Some(ps) = state.playback.take() {
+        ps.handle.close();
     }
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
+fn handle_command(cmd: Command, state: &mut ActorState) {
     match cmd {
         Command::StartRecording {
             spec,
             output_path,
             reply,
         } => {
-            let _ = reply.send(start_session(spec, &output_path, sessions));
+            let _ = reply.send(start_session(spec, &output_path, &mut state.recording));
         }
         Command::Stop { session_id, reply } => {
-            let result = match sessions.remove(&session_id) {
+            let result = match state.recording.remove(&session_id) {
                 None => Err(SessionError::NotFound(session_id)),
                 Some(mut s) => match s.handle.stop() {
                     Ok(clip) => {
@@ -164,8 +246,7 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
                         Ok(clip_to_json(clip, s.started_at))
                     }
                     Err(StopError::NotRecording { current }) => {
-                        // put it back so the agent can inspect / cancel
-                        sessions.insert(session_id, s);
+                        state.recording.insert(session_id, s);
                         Err(SessionError::Stop(format!("NotRecording {{ {current:?} }}")))
                     }
                     Err(StopError::FinalizeFailed(msg)) => {
@@ -177,23 +258,17 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
             let _ = reply.send(result);
         }
         Command::Cancel { session_id, reply } => {
-            let result = match sessions.remove(&session_id) {
+            let result = match state.recording.remove(&session_id) {
                 None => Err(SessionError::NotFound(session_id)),
                 Some(mut s) => match s.handle.cancel() {
                     Ok(()) => {
                         s.handle.close();
-                        // Echo the original path so the agent can verify
-                        // *which* file was deleted. `cancel` deletes the
-                        // partial WAV best-effort; we report success
-                        // unconditionally because the file may not have
-                        // been created yet (early failure) and the agent
-                        // still needs the path for cleanup logging.
                         let path = s.output_path.clone();
                         let deleted = !path.exists();
                         Ok((path, deleted))
                     }
                     Err(CancelError::NotRecording { current }) => {
-                        sessions.insert(session_id, s);
+                        state.recording.insert(session_id, s);
                         Err(SessionError::Cancel(format!("NotRecording {{ {current:?} }}")))
                     }
                 },
@@ -201,7 +276,7 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
             let _ = reply.send(result);
         }
         Command::GetLevels { session_id, reply } => {
-            let result = match sessions.get(&session_id) {
+            let result = match state.recording.get(&session_id) {
                 None => Err(SessionError::NotFound(session_id)),
                 Some(s) => {
                     let mut peak = Vec::with_capacity(s.channels as usize);
@@ -219,7 +294,7 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
             let _ = reply.send(result);
         }
         Command::GetStatus { session_id, reply } => {
-            let result = match sessions.get(&session_id) {
+            let result = match state.recording.get(&session_id) {
                 None => Err(SessionError::NotFound(session_id)),
                 Some(s) => {
                     let elapsed_seconds = SystemTime::now()
@@ -236,7 +311,147 @@ fn handle_command(cmd: Command, sessions: &mut HashMap<Uuid, Session>) {
             };
             let _ = reply.send(result);
         }
+
+        // ============================================================
+        //   Playback handlers
+        // ============================================================
+        Command::PlaybackStart { spec, reply } => {
+            let result = start_playback(spec, &mut state.playback);
+            let _ = reply.send(result);
+        }
+        Command::PlaybackPause { session_id, reply } => {
+            let result = with_playback_session(&mut state.playback, session_id, |ps| {
+                ps.handle.pause().map_err(|e| {
+                    PlaybackSessionError::Transport(format!("{e}"))
+                })?;
+                Ok(playback_transport(ps))
+            });
+            let _ = reply.send(result);
+        }
+        Command::PlaybackResume { session_id, reply } => {
+            let result = with_playback_session(&mut state.playback, session_id, |ps| {
+                ps.handle.resume().map_err(|e| {
+                    PlaybackSessionError::Transport(format!("{e}"))
+                })?;
+                Ok(playback_transport(ps))
+            });
+            let _ = reply.send(result);
+        }
+        Command::PlaybackStop { session_id, reply } => {
+            // Take the session: stop is terminal.
+            let result = match state.playback.take() {
+                None => Err(PlaybackSessionError::NotFound(session_id)),
+                Some(ps) if ps.session_id != session_id => {
+                    let other_id = ps.session_id;
+                    state.playback = Some(ps);
+                    Err(PlaybackSessionError::NotFound(other_id))
+                }
+                Some(mut ps) => match ps.handle.stop() {
+                    Ok(status) => {
+                        ps.handle.close();
+                        Ok(PlaybackStatusJson::from(status))
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        ps.handle.close();
+                        Err(PlaybackSessionError::Transport(msg))
+                    }
+                },
+            };
+            let _ = reply.send(result);
+        }
+        Command::PlaybackSeek {
+            session_id,
+            target_frames,
+            reply,
+        } => {
+            let result = with_playback_session(&mut state.playback, session_id, |ps| {
+                ps.handle.seek(target_frames).map_err(|e| {
+                    PlaybackSessionError::Seek(format!("{e}"))
+                })?;
+                // Return the requested target rather than a fresh
+                // status() snapshot — seek is async (the audio thread
+                // hasn't acked the flush yet), so the snapshot would
+                // still reflect the pre-seek position. Agents expect
+                // "you asked for frame N, you're at frame N now."
+                let sr = f64::from(ps.handle.sample_rate());
+                #[allow(clippy::cast_precision_loss)]
+                let secs = target_frames as f64 / sr;
+                Ok(PlaybackSeekResult {
+                    position_frames: target_frames,
+                    position_seconds: secs,
+                })
+            });
+            let _ = reply.send(result);
+        }
+        Command::PlaybackGetStatus { session_id, reply } => {
+            let result = with_playback_session(&mut state.playback, session_id, |ps| {
+                Ok(PlaybackStatusJson::from(ps.handle.status()))
+            });
+            let _ = reply.send(result);
+        }
+        Command::PlaybackGetLevels { session_id, reply } => {
+            let result = with_playback_session(&mut state.playback, session_id, |ps| {
+                let lv = ps.handle.levels();
+                Ok(LevelsResult {
+                    peak_dbfs: lv.peak_dbfs,
+                    rms_dbfs: lv.rms_dbfs,
+                })
+            });
+            let _ = reply.send(result);
+        }
     }
+}
+
+fn with_playback_session<R>(
+    playback: &mut Option<PlaybackSession>,
+    session_id: Uuid,
+    f: impl FnOnce(&mut PlaybackSession) -> Result<R, PlaybackSessionError>,
+) -> Result<R, PlaybackSessionError> {
+    match playback.as_mut() {
+        None => Err(PlaybackSessionError::NotFound(session_id)),
+        Some(ps) if ps.session_id != session_id => {
+            Err(PlaybackSessionError::NotFound(session_id))
+        }
+        Some(ps) => f(ps),
+    }
+}
+
+fn playback_transport(ps: &PlaybackSession) -> PlaybackTransportResult {
+    let st = ps.handle.status();
+    PlaybackTransportResult {
+        state: PlaybackStatusJson::from(st.clone()).state,
+        position_seconds: st.position_seconds,
+        position_frames: st.position_frames,
+    }
+}
+
+fn start_playback(
+    spec: PlaybackSpec,
+    playback: &mut Option<PlaybackSession>,
+) -> Result<PlaybackStartReply, PlaybackStartError> {
+    if let Some(ps) = playback.as_ref() {
+        return Err(PlaybackStartError::AlreadyPlaying {
+            current_session: ps.session_id,
+        });
+    }
+    let handle = player::open(spec).map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
+    let session_id = Uuid::new_v4();
+    let started_at = SystemTime::now();
+    let status = handle.status();
+    let reply = PlaybackStartReply {
+        session_id,
+        started_at,
+        duration_seconds: status.duration_seconds,
+        sample_rate: status.sample_rate,
+        channels: status.channels,
+    };
+    *playback = Some(PlaybackSession {
+        handle,
+        session_id,
+        started_at,
+    });
+    Ok(reply)
 }
 
 fn start_session(

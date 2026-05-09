@@ -19,11 +19,14 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::audio_actor::{
-    AudioActorHandle, Command, SessionError, StartReplyError, spec_from_args,
+    AudioActorHandle, Command, PlaybackSessionError, PlaybackStartError, SessionError,
+    StartReplyError, spec_from_args,
 };
 use crate::types::{
     CapabilitiesJson, CancelResult, DescribeDeviceArgs, DeviceInfoJson, LevelsResult,
-    ListDevicesResult, RecordedClipJson, SessionArgs, StartArgs, StartResult, StatusResult,
+    ListDevicesResult, ListOutputDevicesResult, OutputDeviceInfoJson, PlaybackSeekArgs,
+    PlaybackSeekResult, PlaybackStartArgs, PlaybackStartResult, PlaybackStatusJson,
+    PlaybackTransportResult, RecordedClipJson, SessionArgs, StartArgs, StartResult, StatusResult,
 };
 
 /// The MCP server's stateful root. Holds the actor handle so each tool
@@ -278,6 +281,296 @@ impl OctaveServer {
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
         }
+    }
+
+    // ============================================================
+    //   Playback tools
+    // ============================================================
+
+    #[tool(
+        name = "playback_list_output_devices",
+        description = "Enumerate every output device the host can see across all backends. Returns each device's stable id, name, backend, default-output flag, and channel count. Safe and read-only."
+    )]
+    async fn playback_list_output_devices(
+        &self,
+    ) -> Result<Json<ListOutputDevicesResult>, ErrorData> {
+        let devices = octave_player::list_output_devices()
+            .into_iter()
+            .map(OutputDeviceInfoJson::from)
+            .collect();
+        Ok(Json(ListOutputDevicesResult { devices }))
+    }
+
+    #[tool(
+        name = "playback_describe_device",
+        description = "Return supported sample rates, channel counts, and buffer sizes for one output device. Use the device_id from playback_list_output_devices."
+    )]
+    async fn playback_describe_device(
+        &self,
+        Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
+    ) -> Result<Json<CapabilitiesJson>, ErrorData> {
+        let id = octave_player::DeviceId(device_id);
+        match octave_player::output_device_capabilities(&id) {
+            Ok(c) => Ok(Json(c.into())),
+            Err(e) => Err(ErrorData::invalid_params(format!("DeviceError::{e}"), None)),
+        }
+    }
+
+    #[tool(
+        name = "playback_start",
+        description = "Open the named output device, load the source (file path or in-memory f32 buffer), and begin playback. Single playback session at a time. Returns a session_id for subsequent transport tools."
+    )]
+    async fn playback_start(
+        &self,
+        Parameters(args): Parameters<PlaybackStartArgs>,
+    ) -> Result<Json<PlaybackStartResult>, ErrorData> {
+        const MAX_BUFFER_SAMPLES: usize = 100 * 1024 * 1024 / 4; // 100 MB of f32
+
+        let source = match args.source {
+            crate::types::PlaybackSourceJson::File { path } => {
+                octave_player::PlaybackSourceSpec::File { path }
+            }
+            crate::types::PlaybackSourceJson::Buffer {
+                samples,
+                sample_rate,
+                channels,
+            } => {
+                if samples.len() > MAX_BUFFER_SAMPLES {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "buffer source too large ({} samples > {} cap); use a file source",
+                            samples.len(),
+                            MAX_BUFFER_SAMPLES
+                        ),
+                        None,
+                    ));
+                }
+                octave_player::PlaybackSourceSpec::Buffer {
+                    samples: samples.into(),
+                    sample_rate,
+                    channels,
+                }
+            }
+        };
+        let spec = octave_player::PlaybackSpec {
+            device_id: octave_player::DeviceId(args.device_id),
+            source,
+            buffer_size: args.buffer_size.into(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackStart { spec, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let reply = rx
+            .await
+            .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+        match reply {
+            Ok(r) => Ok(Json(PlaybackStartResult {
+                session_id: r.session_id.to_string(),
+                started_at_unix_seconds: r
+                    .started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                duration_seconds: r.duration_seconds,
+                sample_rate: r.sample_rate,
+                channels: r.channels,
+            })),
+            Err(PlaybackStartError::AlreadyPlaying { current_session }) => {
+                Err(ErrorData::invalid_request(
+                    format!("AlreadyPlaying: current_session={current_session}"),
+                    None,
+                ))
+            }
+            Err(PlaybackStartError::Start(s)) => Err(ErrorData::invalid_params(s, None)),
+        }
+    }
+
+    #[tool(
+        name = "playback_pause",
+        description = "Pause the active playback session. State transitions to Paused; resume with playback_resume."
+    )]
+    async fn playback_pause(
+        &self,
+        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+    ) -> Result<Json<PlaybackTransportResult>, ErrorData> {
+        let session_id = parse_session_id(&session_id)?;
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackPause { session_id, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        playback_transport_reply(rx).await
+    }
+
+    #[tool(
+        name = "playback_resume",
+        description = "Resume a paused playback session from its current position."
+    )]
+    async fn playback_resume(
+        &self,
+        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+    ) -> Result<Json<PlaybackTransportResult>, ErrorData> {
+        let session_id = parse_session_id(&session_id)?;
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackResume { session_id, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        playback_transport_reply(rx).await
+    }
+
+    #[tool(
+        name = "playback_stop",
+        description = "Stop the active playback session. Drops the device, joins the reader thread, returns the final status."
+    )]
+    async fn playback_stop(
+        &self,
+        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+    ) -> Result<Json<PlaybackStatusJson>, ErrorData> {
+        let session_id = parse_session_id(&session_id)?;
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackStop { session_id, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let reply = rx
+            .await
+            .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+        match reply {
+            Ok(s) => Ok(Json(s)),
+            Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
+                format!("session_not_found: {id}"),
+                None,
+            )),
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+
+    #[tool(
+        name = "playback_seek",
+        description = "Seek to a position in the source. Provide either position_seconds (f64) or position_frames (u64); if both are given, frames win. User-visible cost: one period of silence at the seek point (~1.3 ms at 48 kHz / 64 buffer)."
+    )]
+    async fn playback_seek(
+        &self,
+        Parameters(args): Parameters<PlaybackSeekArgs>,
+    ) -> Result<Json<PlaybackSeekResult>, ErrorData> {
+        let session_id = parse_session_id(&args.session_id)?;
+
+        // Resolve the seek target. We need the session's sample_rate to
+        // convert seconds → frames; ask the actor for status first.
+        let target_frames = if let Some(f) = args.position_frames {
+            f
+        } else if let Some(secs) = args.position_seconds {
+            let (st_tx, st_rx) = oneshot::channel();
+            self.actor
+                .send(Command::PlaybackGetStatus { session_id, reply: st_tx })
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            let status = st_rx
+                .await
+                .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?
+                .map_err(|e| match e {
+                    PlaybackSessionError::NotFound(id) => ErrorData::invalid_params(
+                        format!("session_not_found: {id}"),
+                        None,
+                    ),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let frames = (secs * f64::from(status.sample_rate)).max(0.0) as u64;
+            frames
+        } else {
+            return Err(ErrorData::invalid_params(
+                "playback_seek: provide position_seconds or position_frames",
+                None,
+            ));
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackSeek {
+                session_id,
+                target_frames,
+                reply: tx,
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let reply = rx
+            .await
+            .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+        match reply {
+            Ok(r) => Ok(Json(r)),
+            Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
+                format!("session_not_found: {id}"),
+                None,
+            )),
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+
+    #[tool(
+        name = "playback_get_status",
+        description = "Return the playback session's state, position, duration, and xrun count. Safe to poll."
+    )]
+    async fn playback_get_status(
+        &self,
+        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+    ) -> Result<Json<PlaybackStatusJson>, ErrorData> {
+        let session_id = parse_session_id(&session_id)?;
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackGetStatus { session_id, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let reply = rx
+            .await
+            .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+        match reply {
+            Ok(s) => Ok(Json(s)),
+            Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
+                format!("session_not_found: {id}"),
+                None,
+            )),
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+
+    #[tool(
+        name = "playback_get_levels",
+        description = "Read current per-channel peak and RMS output levels in dBFS. Safe to poll at meter rates (~30 Hz). Returns -180 dBFS before the first audio buffer is rendered."
+    )]
+    async fn playback_get_levels(
+        &self,
+        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+    ) -> Result<Json<LevelsResult>, ErrorData> {
+        let session_id = parse_session_id(&session_id)?;
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send(Command::PlaybackGetLevels { session_id, reply: tx })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let reply = rx
+            .await
+            .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+        match reply {
+            Ok(l) => Ok(Json(l)),
+            Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
+                format!("session_not_found: {id}"),
+                None,
+            )),
+            Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
+        }
+    }
+}
+
+async fn playback_transport_reply(
+    rx: oneshot::Receiver<Result<PlaybackTransportResult, PlaybackSessionError>>,
+) -> Result<Json<PlaybackTransportResult>, ErrorData> {
+    let reply = rx
+        .await
+        .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
+    match reply {
+        Ok(r) => Ok(Json(r)),
+        Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
+            format!("session_not_found: {id}"),
+            None,
+        )),
+        Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
     }
 }
 

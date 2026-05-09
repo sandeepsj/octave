@@ -11,6 +11,7 @@ homepage.workspace     = true
 repository.workspace   = true
 
 [dependencies]
+octave-player      = { workspace = true }
 octave-recorder    = { workspace = true }
 rmcp               = { workspace = true }
 tokio              = { workspace = true }
