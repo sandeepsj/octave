@@ -36,7 +36,11 @@ pub struct DeviceInfoJson {
 }
 
 /// Stringified backend, friendlier in JSON than the rust enum.
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+///
+/// `Other(String)` carries the raw cpal `HostId::name()` for hosts not
+/// in the explicit set — agents can pattern-match the well-known names
+/// and treat anything else as opaque.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendJson {
     Alsa,
@@ -47,6 +51,7 @@ pub enum BackendJson {
     CoreAudio,
     Wasapi,
     Asio,
+    Other(String),
 }
 
 impl From<Backend> for BackendJson {
@@ -58,6 +63,7 @@ impl From<Backend> for BackendJson {
             Backend::CoreAudio => Self::CoreAudio,
             Backend::Wasapi => Self::Wasapi,
             Backend::Asio => Self::Asio,
+            Backend::Other(name) => Self::Other(name),
         }
     }
 }

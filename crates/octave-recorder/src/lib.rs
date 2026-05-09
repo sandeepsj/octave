@@ -50,7 +50,15 @@ pub use state::RecorderState;
 pub struct DeviceId(pub String);
 
 /// The kernel-level audio backend a device is exposed through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PipeWire` is **reserved** for future direct-PipeWire integrations;
+/// today PipeWire on Linux is reached via the `Alsa` host (cpal exposes
+/// it as ALSA), so `host_id_to_backend` never produces this variant.
+///
+/// `Other(name)` is returned for any cpal `HostId::name()` value not
+/// in the explicit list — better than silently coercing to `Alsa`,
+/// which used to mis-tag macOS / Windows / future hosts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     Alsa,
     PipeWire,
@@ -58,6 +66,7 @@ pub enum Backend {
     CoreAudio,
     Wasapi,
     Asio,
+    Other(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
