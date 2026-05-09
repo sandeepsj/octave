@@ -141,4 +141,33 @@ mod tests {
             std::env::remove_var("OCTAVE_MCP_TOOLS");
         }
     }
+
+    /// Plan §4.2 / §10.1 single-source-of-truth for the tool set.
+    /// Asserting the exact list catches accidental adds/drops/renames
+    /// at compile-time of the test rather than at first agent contact.
+    #[test]
+    fn all_tool_names_matches_published_set_of_16() {
+        let mut got = OctaveServer::all_tool_names();
+        got.sort();
+        let expected = [
+            "playback_describe_device",
+            "playback_get_levels",
+            "playback_get_status",
+            "playback_list_output_devices",
+            "playback_pause",
+            "playback_resume",
+            "playback_seek",
+            "playback_start",
+            "playback_stop",
+            "recording_cancel",
+            "recording_describe_device",
+            "recording_get_levels",
+            "recording_get_status",
+            "recording_list_devices",
+            "recording_start",
+            "recording_stop",
+        ];
+        assert_eq!(got.len(), 16, "expected 16 tools, got {}: {got:?}", got.len());
+        assert_eq!(got.iter().map(String::as_str).collect::<Vec<_>>(), expected);
+    }
 }
