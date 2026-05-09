@@ -164,8 +164,12 @@ pub fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, D
 /// success the returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
 pub fn open(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
     let device = find_device(&spec.device_id)?;
-    let (source, source_rate, source_channels, duration_frames) =
-        construct_source(&spec.source)?;
+    let ConstructedSource {
+        source,
+        sample_rate: source_rate,
+        channels: source_channels,
+        duration_frames,
+    } = construct_source(&spec.source)?;
 
     validate_source_against_device(&spec.device_id, source_rate, source_channels)?;
 
@@ -198,18 +202,30 @@ pub fn open(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
     })
 }
 
+/// Constructed-source bundle returned by [`construct_source`].
+/// Replaces the previous 4-tuple to keep clippy's `type_complexity`
+/// happy and to give the fields names at every call site.
+pub(crate) struct ConstructedSource {
+    pub source: Box<dyn PlaybackSource>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub duration_frames: Option<u64>,
+}
+
 /// Construct the boxed PlaybackSource impl from the user-facing spec.
-/// Returns `(source, sample_rate, channels, duration_frames)`.
-fn construct_source(
-    source_spec: &PlaybackSourceSpec,
-) -> Result<(Box<dyn PlaybackSource>, u32, u16, Option<u64>), StartError> {
+fn construct_source(source_spec: &PlaybackSourceSpec) -> Result<ConstructedSource, StartError> {
     Ok(match source_spec {
         PlaybackSourceSpec::File { path } => {
             let fs = FileSource::open(path)?;
-            let sr = fs.sample_rate();
-            let ch = fs.channels();
-            let dur = fs.duration_frames();
-            (Box::new(fs), sr, ch, dur)
+            let sample_rate = fs.sample_rate();
+            let channels = fs.channels();
+            let duration_frames = fs.duration_frames();
+            ConstructedSource {
+                source: Box::new(fs),
+                sample_rate,
+                channels,
+                duration_frames,
+            }
         }
         PlaybackSourceSpec::Buffer {
             samples,
@@ -223,8 +239,13 @@ fn construct_source(
                     )
                 },
             )?;
-            let dur = bs.duration_frames();
-            (Box::new(bs), *sample_rate, *channels, dur)
+            let duration_frames = bs.duration_frames();
+            ConstructedSource {
+                source: Box::new(bs),
+                sample_rate: *sample_rate,
+                channels: *channels,
+                duration_frames,
+            }
         }
     })
 }
@@ -270,7 +291,7 @@ fn build_running_pipeline(
     let chosen = supported
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == channels)
         .find(|c| c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate)
-        .ok_or_else(|| StartError::RateMismatch {
+        .ok_or(StartError::RateMismatch {
             source_rate: sample_rate,
             device_rate: 0,
         })?;
@@ -461,14 +482,26 @@ impl PlaybackHandle {
         // Rebuild path.
         let device = find_device(&self.inner.spec.device_id)
             .map_err(|e| TransportError::BackendFailed(format!("{e}")))?;
-        let (mut source, source_rate, source_channels, _dur) =
-            construct_source(&self.inner.spec.source)
-                .map_err(|e| TransportError::BackendFailed(format!("{e}")))?;
+        let ConstructedSource {
+            mut source,
+            sample_rate: source_rate,
+            channels: source_channels,
+            duration_frames: _,
+        } = construct_source(&self.inner.spec.source)
+            .map_err(|e| TransportError::BackendFailed(format!("{e}")))?;
         let resume_at = self.inner.telemetry.position_frames.load(Ordering::Acquire);
-        // Seek the source to where we stopped hearing audio.
+        // Seek the source to where we stopped hearing audio. If the
+        // source can't seek that far (e.g., file truncated since the
+        // pause), fall back to the start. If even seek(0) fails, the
+        // source is in an unusable state — return BackendFailed
+        // rather than silently playing from an unknown offset.
         if let Err(e) = source.seek(resume_at) {
             tracing::warn!(?e, frame = resume_at, "rebuild seek failed; resuming from 0");
-            let _ = source.seek(0);
+            if let Err(zero_err) = source.seek(0) {
+                return Err(TransportError::BackendFailed(format!(
+                    "rebuild seek({resume_at}) failed and fallback seek(0) also failed: {zero_err}"
+                )));
+            }
             self.inner.telemetry.set_position_frames(0);
         }
         let (stream, reader_join) = build_running_pipeline(
@@ -582,11 +615,16 @@ impl PlaybackHandle {
     /// Combined snapshot — state, position, duration, xruns.
     pub fn status(&self) -> PlaybackStatus {
         let pos = self.position_frames();
-        let pos_secs = pos as f64 / self.inner.sample_rate as f64;
+        // u64 frame index → f64 seconds: lossy in the abstract (u64 is
+        // 64-bit, f64 mantissa is 52-bit), exact for any real session
+        // since 2^52 frames @ 192 kHz is ≈ 743 years of audio.
+        #[allow(clippy::cast_precision_loss)]
+        let pos_secs = pos as f64 / f64::from(self.inner.sample_rate);
+        #[allow(clippy::cast_precision_loss)]
         let dur_secs = self
             .inner
             .duration_frames
-            .map(|d| d as f64 / self.inner.sample_rate as f64);
+            .map(|d| d as f64 / f64::from(self.inner.sample_rate));
         // Resolve the lazy "playing → ended" transition for callers.
         let state = if self.inner.state == PlaybackState::Playing
             && self.inner.signals.playback_complete.load(Ordering::Acquire)

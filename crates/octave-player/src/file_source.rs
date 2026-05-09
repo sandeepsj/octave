@@ -70,7 +70,10 @@ impl PlaybackSource for FileSource {
             return 0;
         }
         let max_frames_dst = dst.len() / ch;
-        let remaining = (self.total_frames - self.cursor) as usize;
+        // total_frames - cursor fits in u64; saturating into usize is
+        // safe because pull is bounded by `dst.len() / ch ≤ usize::MAX`
+        // and we min the two below.
+        let remaining = usize::try_from(self.total_frames - self.cursor).unwrap_or(usize::MAX);
         let frames = max_frames_dst.min(remaining);
         if frames == 0 {
             return 0;

@@ -107,15 +107,18 @@ impl PlaybackSource for BufferSource {
         }
 
         let max_frames_dst = dst.len() / ch;
-        // Safe: cursor < total ≤ usize::MAX on 64-bit; saturating to be
-        // explicit. `remaining` then fits in usize.
-        let remaining = (total - self.cursor) as usize;
+        // BufferSource is backed by Arc<[f32]> whose .len() is itself
+        // usize, so total - cursor is bounded by usize::MAX by
+        // construction. try_from + saturate is the explicit form.
+        let remaining = usize::try_from(total - self.cursor).unwrap_or(usize::MAX);
         let frames = max_frames_dst.min(remaining);
         if frames == 0 {
             return 0;
         }
 
-        let start = (self.cursor as usize) * ch;
+        // Same bound: cursor ≤ total ≤ usize::MAX (samples.len() / ch).
+        let cursor_usize = usize::try_from(self.cursor).unwrap_or(usize::MAX);
+        let start = cursor_usize * ch;
         let end = start + frames * ch;
         dst[..frames * ch].copy_from_slice(&self.samples[start..end]);
         self.cursor += frames as u64;

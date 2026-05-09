@@ -78,7 +78,10 @@ fn main() -> ExitCode {
     let sr = handle.sample_rate();
     let ch = handle.channels();
     let dur_frames = handle.status().duration_frames.unwrap_or(0);
-    let dur_secs = dur_frames as f64 / sr as f64;
+    // Frame counts and percentages — exact for any real session
+    // (2^52 frames @ 192 kHz ≈ 743 years).
+    #[allow(clippy::cast_precision_loss)]
+    let dur_secs = dur_frames as f64 / f64::from(sr);
     println!(
         "playing {} ({:.2} s, {sr} Hz, {ch} ch)\n",
         input_path.display(),
@@ -94,6 +97,7 @@ fn main() -> ExitCode {
         } else {
             f32::NEG_INFINITY
         };
+        #[allow(clippy::cast_precision_loss)]
         let pos_pct = if dur_frames > 0 {
             100.0 * (status.position_frames as f64 / dur_frames as f64)
         } else {

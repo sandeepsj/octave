@@ -58,7 +58,7 @@ pub(crate) struct WavMeta {
 impl WavMeta {
     pub fn frame_count(&self) -> u64 {
         let frame_size = u64::from(self.channels) * 4;
-        if frame_size == 0 { 0 } else { self.data_bytes / frame_size }
+        self.data_bytes.checked_div(frame_size).unwrap_or(0)
     }
 }
 
@@ -426,7 +426,7 @@ mod tests {
         h.push(0u8); // RIFF pad (chunks align to 2)
         // data
         h.extend_from_slice(b"data");
-        h.extend_from_slice(&(audio.len() as u32).to_le_bytes());
+        h.extend_from_slice(&u32::try_from(audio.len()).unwrap().to_le_bytes());
         h.extend_from_slice(&audio);
 
         let mut c = Cursor::new(h);
