@@ -830,6 +830,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "octave-player"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "octave-recorder"
 version = "0.1.0"
 dependencies = [

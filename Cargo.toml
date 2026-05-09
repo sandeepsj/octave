@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/octave-mcp",
+    "crates/octave-player",
     "crates/octave-recorder",
 ]
 

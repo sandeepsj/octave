@@ -1,0 +1,19 @@
+[package]
+name        = "octave-player"
+version     = "0.1.0"
+description = "Octave's audio output layer: open a device, pull frames from a file or in-memory buffer, push to the device. Sample-accurate transport, no dropouts, no allocations, no locks on the audio thread."
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+serde     = { workspace = true }
+thiserror = { workspace = true }
+uuid      = { workspace = true }
+
+[lints]
+workspace = true
