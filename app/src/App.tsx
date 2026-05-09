@@ -6,6 +6,10 @@ import { invoke } from "@tauri-apps/api/core";
 interface OutputDeviceInfo {
   device_id: string;
   name: string;
+  /// Linux-only: the human-readable name from /proc/asound/cards
+  /// (e.g. "Focusrite Scarlett Solo USB"). Other platforms always
+  /// null — Core Audio / WASAPI hand the friendly name in `name`.
+  friendly_name: string | null;
   backend: string;
   is_default_output: boolean;
   max_output_channels: number;
@@ -33,14 +37,15 @@ function isEssential(d: OutputDeviceInfo): boolean {
 }
 
 /// Pretty-print a raw ALSA device name. cpal hands us the kernel's
-/// PCM identifier (`hw:CARD=Generic_1,DEV=0`); for the picker we
-/// extract the card name + a short type tag so the row reads
-/// "Generic_1 (hardware)" instead of the raw form. Non-Alsa backends
-/// pass through untouched.
+/// PCM identifier (`hw:CARD=Generic_1,DEV=0`); the Tauri command
+/// enriches with `friendly_name` from /proc/asound/cards when
+/// available. We prefer the friendly name; otherwise fall back to
+/// extracting the card slug. Non-Alsa backends pass through untouched.
 function prettify(d: OutputDeviceInfo): string {
   if (d.backend !== "Alsa") return d.name;
   if (d.name === "default") return "System default";
   if (d.name === "pipewire") return "PipeWire";
+  if (d.friendly_name) return d.friendly_name;
   const m = d.name.match(/^hw:CARD=([^,]+),DEV=\d+$/);
   if (m) return `${m[1]} (hardware)`;
   return d.name;
