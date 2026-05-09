@@ -673,9 +673,14 @@ impl PlaybackHandle {
 
     /// Tear everything down. Idempotent. Consumes the handle.
     pub fn close(mut self) {
-        // Make sure stop ran (no-op if already stopped).
+        // Use the lazy state() so a session that finished naturally
+        // (playback_complete is set, inner.state still Playing) is
+        // recognised as Ended and skips the stop() call. Otherwise
+        // close() would re-invoke stop()'s pause + drain on a
+        // finished stream.
+        let observed = self.state();
         if !matches!(
-            self.inner.state,
+            observed,
             PlaybackState::Stopped | PlaybackState::Closed | PlaybackState::Errored | PlaybackState::Ended
         ) {
             let _ = self.stop();
