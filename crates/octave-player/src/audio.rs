@@ -197,7 +197,7 @@ const PAUSE_VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// in 8 ms at any sample rate).
 const PAUSE_VERIFY_GRACE_FRAMES: u64 = 4_096;
 
-/// Opaque handle returned by [`open`]. `!Send` (cpal's `Stream` is
+/// Opaque handle returned by [`start`]. `!Send` (cpal's `Stream` is
 /// `!Send` on every backend) — keep it on the thread that opened it.
 pub struct PlaybackHandle {
     inner: Internals,
@@ -345,7 +345,7 @@ fn validate_source_against_device(
 }
 
 /// Build the cpal output stream + spawn the reader thread + start the
-/// stream. Used both by initial `open` and by `resume`'s rebuild path.
+/// stream. Used both by initial `start` and by `resume`'s rebuild path.
 /// Sleeps `PRE_ROLL_MS` before `stream.play()` so the very first
 /// callback finds the ring primed.
 fn build_running_pipeline(
@@ -684,7 +684,7 @@ impl PlaybackHandle {
         PlaybackLevels { peak_dbfs: peak, rms_dbfs: rms }
     }
 
-    /// Cumulative under-runs since `open`.
+    /// Cumulative under-runs since `start`.
     pub fn xrun_count(&self) -> u32 {
         self.inner.telemetry.xrun_count.load(Ordering::Relaxed)
     }

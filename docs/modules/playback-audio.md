@@ -633,8 +633,8 @@ pub struct PlaybackLevels {
 | `output_device_capabilities` | `fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, OpenError>` | — | Supported configs | `DeviceNotFound`, `BackendError` | stable |
 | `start` | `fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError>` | spec valid against capabilities; no other session active | Handle in `Playing` state, audio flowing | `DeviceNotFound`, `BackendError`, `SourceUnreadable`, `RateUnsupportedByDevice`, `ChannelsUnsupportedByDevice`, `BufferSizeOutOfRange`, `NoMatchingStreamConfig`, `BuildStreamFailed`, `PlayStreamFailed`, `AlreadyPlaying` | stable |
 | `pause` | `fn pause(&mut self) -> Result<(), TransportError>` | state == `Playing` | state == `Paused`, audio thread halted | `NotPlaying { current }` | stable |
-| `resume` | `fn resume(&mut self) -> Result<(), TransportError>` | state == `Paused` | state == `Playing`, audio resumes from current position | `NotPaused { current }`, `BuildStreamFailed` (rebuild path) | stable |
-| `stop` | `fn stop(&mut self) -> Result<PlaybackStatus, TransportError>` | state ∈ {`Playing`, `Paused`, `Ended`} | state == `Stopped`, stream dropped | `NotActive { current }` | stable |
+| `resume` | `fn resume(&mut self) -> Result<(), TransportError>` | state == `Paused` | state == `Playing`, audio resumes from current position | `NotPaused { current }`, `BackendFailed` (rebuild path) | stable |
+| `stop` | `fn stop(&mut self) -> Result<PlaybackStatus, StopError>` | state ∈ {`Playing`, `Paused`, `Ended`} | state == `Stopped`, stream dropped | `NotActive { current }` | stable |
 | `seek` | `fn seek(&mut self, frame: u64) -> Result<(), SeekError>` | state ∈ {`Playing`, `Paused`} | position == `frame`, callback resumes from new position | `NotSeekable { current }`, `OutOfBounds { requested, max }` | stable |
 | `position_frames` | `fn position_frames(&self) -> u64` | state ≥ `Playing` | Current frame index | — | stable |
 | `peak_dbfs` | `fn peak_dbfs(&self, channel: u16) -> f32` | state ≥ `Playing` | dBFS of last buffer | — | stable |
@@ -681,14 +681,25 @@ pub enum StartError {
 pub enum TransportError {
     NotPlaying { current: PlaybackState },
     NotPaused { current: PlaybackState },
+    /// Returned by `pause`'s verify-and-rebuild fallback (§5.7) and
+    /// by `resume`'s rebuild path when the backend can't start the
+    /// freshly-built stream.
+    BackendFailed(String),
+}
+
+pub enum StopError {
     NotActive { current: PlaybackState },
-    BuildStreamFailed(String),     // resume after pause-rebuild
 }
 
 pub enum SeekError {
     NotSeekable { current: PlaybackState },
     OutOfBounds { requested: u64, max: u64 },
-    SourceSeekFailed(String),
+    // v0.1: source-seek failures (file truncated, I/O error) are
+    // surfaced as EOF — the reader sets `eof_seen` and the audio
+    // callback transitions state to Ended (see §5.6 / §5.8 / §11.3).
+    // `SourceSeekFailed(String)` was on this enum in early drafts
+    // but the engine never produces it; revisit if a use case
+    // emerges that needs to distinguish "seek failed" from "EOF".
 }
 ```
 

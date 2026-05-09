@@ -12,16 +12,16 @@
 //!
 //! # Status (v0.1)
 //!
-//! Working: device enumeration + capability query, file source (WAV /
-//! RF64), in-memory buffer source, RT output callback with seek/EOF
-//! handshake atomics, reader thread, [`open`] +
-//! [`PlaybackHandle::stop`] / [`PlaybackHandle::status`] /
-//! [`PlaybackHandle::levels`] / [`PlaybackHandle::close`]. Working
-//! example binary at `examples/play-demo.rs`.
-//!
-//! Not yet wired through `PlaybackHandle`: pause / resume (signals
-//! exist; API methods land next), seek (handshake works at the RT
-//! and reader layers; API method lands next), MCP tool surface.
+//! Working end-to-end: device enumeration + capability query, file
+//! source (WAV / RF64), in-memory buffer source, RT output callback
+//! with seek/EOF handshake atomics, reader thread, [`start`] /
+//! [`PlaybackHandle::pause`] / [`PlaybackHandle::resume`] (with the
+//! verify-and-rebuild fallback for the cpal pause silent-no-op trap)
+//! / [`PlaybackHandle::seek`] / [`PlaybackHandle::stop`] /
+//! [`PlaybackHandle::status`] / [`PlaybackHandle::levels`] /
+//! [`PlaybackHandle::close`]. Working example binary at
+//! `examples/play-demo.rs`. The MCP tool surface (`playback_*` tools)
+//! lives in the separate `octave-mcp` crate.
 
 #![cfg_attr(test, allow(clippy::float_cmp, clippy::cast_precision_loss))]
 
