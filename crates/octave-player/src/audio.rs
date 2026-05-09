@@ -91,6 +91,26 @@ pub enum StopError {
     NotActive { current: PlaybackState },
 }
 
+/// Errors returned by [`PlaybackHandle::pause`] and [`PlaybackHandle::resume`].
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("not playing (current state: {current:?})")]
+    NotPlaying { current: PlaybackState },
+    #[error("not paused (current state: {current:?})")]
+    NotPaused { current: PlaybackState },
+    #[error("backend pause/play failed: {0}")]
+    BackendFailed(String),
+}
+
+/// Errors returned by [`PlaybackHandle::seek`].
+#[derive(Debug, Error)]
+pub enum SeekError {
+    #[error("not seekable (current state: {current:?})")]
+    NotSeekable { current: PlaybackState },
+    #[error("seek out of bounds: requested frame {requested}, source has {max} frames")]
+    OutOfBounds { requested: u64, max: u64 },
+}
+
 /// Internal state held by [`PlaybackHandle`]. Not exposed.
 struct Internals {
     state: PlaybackState,
@@ -261,17 +281,84 @@ pub fn open(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
 }
 
 impl PlaybackHandle {
+    /// Pause playback. State transitions to [`PlaybackState::Paused`].
+    /// On backends where `cpal::Stream::pause` honours the request
+    /// (most), the audio callback halts immediately. On backends
+    /// where it silently no-ops (some PipeWire-bridged ALSA devices —
+    /// see plan §5.7 and the recorder's `978fa91`), audio keeps
+    /// playing. v0.1 ships the simple path; a verify-and-rebuild
+    /// fallback that drops + re-opens the stream lands as a
+    /// follow-up commit if real backend behaviour requires it.
+    pub fn pause(&mut self) -> Result<(), TransportError> {
+        if self.inner.state != PlaybackState::Playing {
+            return Err(TransportError::NotPlaying { current: self.inner.state });
+        }
+        if let Some(stream) = self.inner.stream.as_ref() {
+            stream
+                .pause()
+                .map_err(|e| TransportError::BackendFailed(e.to_string()))?;
+        }
+        self.inner.state = PlaybackState::Paused;
+        Ok(())
+    }
+
+    /// Seek to `frame`. Allowed from `Playing`, `Paused`, or `Ended`
+    /// (in which case the seek implicitly transitions back toward
+    /// `Playing` as the audio thread plays out the new region).
+    /// Out-of-range frames return [`SeekError::OutOfBounds`].
+    ///
+    /// Triggers the seek-flush handshake (plan §5.6): the reader
+    /// signals the audio callback to drain the ring + jump the
+    /// position counter, then re-positions the source. User-visible
+    /// effect is one period (~1.3 ms at 48 kHz / 64 buffer) of
+    /// silence at the seek point.
+    pub fn seek(&mut self, frame: u64) -> Result<(), SeekError> {
+        if matches!(
+            self.state(),
+            PlaybackState::Idle
+                | PlaybackState::Closed
+                | PlaybackState::Errored
+                | PlaybackState::Stopped
+                | PlaybackState::Loading
+        ) {
+            return Err(SeekError::NotSeekable { current: self.state() });
+        }
+        if let Some(dur) = self.inner.duration_frames {
+            if frame > dur {
+                return Err(SeekError::OutOfBounds { requested: frame, max: dur });
+            }
+        }
+        self.inner.signals.request_seek(frame);
+        Ok(())
+    }
+
+    /// Resume from Paused. Position carries over; reader was idle
+    /// while paused (ring full or empty depending on timing).
+    pub fn resume(&mut self) -> Result<(), TransportError> {
+        if self.inner.state != PlaybackState::Paused {
+            return Err(TransportError::NotPaused { current: self.inner.state });
+        }
+        if let Some(stream) = self.inner.stream.as_ref() {
+            stream
+                .play()
+                .map_err(|e| TransportError::BackendFailed(e.to_string()))?;
+        }
+        self.inner.state = PlaybackState::Playing;
+        Ok(())
+    }
+
     /// Stop playback immediately. Drops the stream, signals the
     /// reader thread to exit, joins it. Idempotent — safe to call
     /// from any non-Closed state.
     pub fn stop(&mut self) -> Result<PlaybackStatus, StopError> {
+        // stop() is also legal from Paused (and from the lazy Ended,
+        // which we observe via state()).
+        let observed = self.state();
         if matches!(
-            self.inner.state,
+            observed,
             PlaybackState::Idle | PlaybackState::Closed | PlaybackState::Errored
         ) {
-            return Err(StopError::NotActive {
-                current: self.inner.state,
-            });
+            return Err(StopError::NotActive { current: observed });
         }
 
         // Tell both the audio callback and the reader to exit.

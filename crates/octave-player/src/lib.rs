@@ -37,7 +37,10 @@ mod telemetry;
 mod types;
 mod wav;
 
-pub use audio::{PlaybackHandle, StartError, StopError, open, list_output_devices, output_device_capabilities};
+pub use audio::{
+    PlaybackHandle, SeekError as PlaybackSeekError, StartError, StopError, TransportError,
+    list_output_devices, open, output_device_capabilities,
+};
 pub use device::DeviceError;
 pub use file_source::{FileSource, OpenFileError};
 pub use source::{BufferSource, PlaybackSource, SeekError};
