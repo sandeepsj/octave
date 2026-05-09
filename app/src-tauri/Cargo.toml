@@ -1,0 +1,48 @@
+[package]
+name        = "octave-app"
+version     = "0.0.1"
+description = "Octave Tauri shell — wraps the engine crates behind a React UI."
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+authors      = ["Sandeep SJ <sandeepsj0000@gmail.com>"]
+homepage     = "https://github.com/sandeepsj/octave"
+repository   = "https://github.com/sandeepsj/octave"
+
+# Tauri's recommended layout: a thin `bin` (main.rs) calling into a
+# library so future tauri::test integrations can target the same code.
+[lib]
+name = "octave_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri      = { version = "2", features = [] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Engine crate the UI exposes via tauri::commands. Path-dep
+# (octave-app is intentionally NOT a workspace member — see root
+# Cargo.toml comment).
+octave-player = { path = "../../crates/octave-player" }
+
+# Mirror the workspace's clippy gates so the app's Rust side is
+# held to the same bar as the engine crates.
+[lints.clippy]
+float_cmp                = "warn"
+lossy_float_literal      = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap       = "warn"
+cast_precision_loss      = "warn"
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+debug         = false
+panic         = "abort"
+strip         = "symbols"
+
+[profile.dev]
+debug-assertions = true
+overflow-checks  = true

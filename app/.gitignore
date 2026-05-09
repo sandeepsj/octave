@@ -1,0 +1,20 @@
+# Frontend
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+
+# Tauri (Rust target dir is in workspace target/ already)
+src-tauri/target
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+.DS_Store

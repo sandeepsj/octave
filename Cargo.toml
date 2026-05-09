@@ -5,6 +5,14 @@ members = [
     "crates/octave-player",
     "crates/octave-recorder",
 ]
+# `app/src-tauri` is intentionally NOT a workspace member — Tauri's
+# Linux build needs `webkit2gtk-4.1-dev` + `libsoup-3.0-dev` which
+# aren't part of the engine-crate gate. `exclude` is required so
+# cargo's parent-walk doesn't auto-claim the nested manifest. Build
+# the app explicitly from `app/`:
+#   pnpm install && pnpm tauri dev      (run the desktop shell)
+#   cd app/src-tauri && cargo check     (just type-check the Rust)
+exclude = ["app/src-tauri"]
 
 [workspace.package]
 edition      = "2024"
