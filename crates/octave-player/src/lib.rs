@@ -22,7 +22,9 @@
 
 mod file_source;
 mod ring;
+mod rt;
 mod source;
+mod telemetry;
 mod wav;
 
 pub use file_source::{FileSource, OpenFileError};
