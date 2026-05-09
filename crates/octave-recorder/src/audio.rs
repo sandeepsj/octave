@@ -637,6 +637,117 @@ mod tests {
 
     // ---------- §5.5 buffer-size period bounds ----------
 
+    /// Test-only constructor: build a `RecordingHandle` in an arbitrary
+    /// state without opening a cpal device. Used to exercise the
+    /// state-transition error paths in arm/record/stop/cancel without
+    /// hardware.
+    fn handle_for_test(state: RecorderState, channels: u16, sample_rate: u32) -> RecordingHandle {
+        RecordingHandle {
+            inner: Internals {
+                state,
+                sample_rate,
+                channels,
+                telemetry: Telemetry::new(channels),
+                consumer: None,
+                stream: None,
+                writer: None,
+                started_at: None,
+            },
+        }
+    }
+
+    // ---------- state-transition error paths (plan §9.2 contracts) ----------
+
+    #[test]
+    fn arm_from_non_idle_returns_not_idle() {
+        for bad_state in [
+            RecorderState::Armed,
+            RecorderState::Recording,
+            RecorderState::Stopping,
+            RecorderState::Cancelling,
+        ] {
+            let mut h = handle_for_test(bad_state, 2, 48_000);
+            match h.arm() {
+                Err(ArmError::NotIdle { current }) => {
+                    assert_eq!(current, bad_state, "NotIdle reports the actual current state");
+                }
+                Err(other) => panic!("expected NotIdle for state {bad_state:?}, got {other:?}"),
+                Ok(()) => panic!("expected NotIdle for state {bad_state:?}, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn record_from_non_armed_returns_not_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_created.wav");
+        for bad_state in [
+            RecorderState::Idle,
+            RecorderState::Recording,
+            RecorderState::Stopping,
+            RecorderState::Cancelling,
+        ] {
+            let mut h = handle_for_test(bad_state, 2, 48_000);
+            match h.record(&path) {
+                Err(RecordError::NotArmed { current }) => {
+                    assert_eq!(current, bad_state);
+                }
+                Err(other) => panic!("expected NotArmed for state {bad_state:?}, got {other:?}"),
+                Ok(()) => panic!("expected NotArmed for state {bad_state:?}, got Ok"),
+            }
+            // Critical: the state-check must reject BEFORE WavWriter::create
+            // touches the disk. If the file was created the early-return
+            // contract is broken.
+            assert!(
+                !path.exists(),
+                "record() created the output file from non-Armed state {bad_state:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn stop_from_non_recording_returns_not_recording() {
+        for bad_state in [
+            RecorderState::Idle,
+            RecorderState::Armed,
+            RecorderState::Stopping,
+            RecorderState::Cancelling,
+        ] {
+            let mut h = handle_for_test(bad_state, 2, 48_000);
+            match h.stop() {
+                Err(StopError::NotRecording { current }) => assert_eq!(current, bad_state),
+                Err(other) => panic!("expected NotRecording for {bad_state:?}, got {other:?}"),
+                Ok(_) => panic!("expected NotRecording for {bad_state:?}, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_from_non_recording_returns_not_recording() {
+        for bad_state in [
+            RecorderState::Idle,
+            RecorderState::Armed,
+            RecorderState::Stopping,
+            RecorderState::Cancelling,
+        ] {
+            let mut h = handle_for_test(bad_state, 2, 48_000);
+            match h.cancel() {
+                Err(CancelError::NotRecording { current }) => assert_eq!(current, bad_state),
+                Err(other) => panic!("expected NotRecording for {bad_state:?}, got {other:?}"),
+                Ok(()) => panic!("expected NotRecording for {bad_state:?}, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_lazily_reports_errored_when_telemetry_flag_set() {
+        let h = handle_for_test(RecorderState::Recording, 2, 48_000);
+        assert_eq!(h.state(), RecorderState::Recording);
+        // Audio thread (simulated): set the errored flag.
+        h.inner.telemetry.errored.store(true, Ordering::Release);
+        assert_eq!(h.state(), RecorderState::Errored);
+    }
+
     #[test]
     fn period_bounds_accept_typical_buffer_sizes() {
         // 64 samples @ 48 kHz = 1.33 ms — well inside [0.5, 100] ms.
