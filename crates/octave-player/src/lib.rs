@@ -20,6 +20,10 @@
 
 #![cfg_attr(test, allow(clippy::float_cmp, clippy::cast_precision_loss))]
 
+mod file_source;
 mod source;
+mod wav;
 
+pub use file_source::{FileSource, OpenFileError};
 pub use source::{BufferSource, PlaybackSource, SeekError};
+pub use wav::ParseError;
