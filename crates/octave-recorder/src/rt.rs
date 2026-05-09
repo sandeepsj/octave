@@ -41,15 +41,23 @@ fn ensure_ftz_daz_set() {
 
 #[cfg(target_arch = "x86_64")]
 fn set_ftz_daz() {
+    // The MXCSR getcsr/setcsr intrinsics are deprecated by Rust in
+    // favour of inline assembly, but the inline-asm rewrite is
+    // strictly stylistic — the intrinsics still emit identical
+    // STMXCSR/LDMXCSR sequences. Once Rust removes them entirely
+    // we'll switch; until then `allow(deprecated)` is the lower-
+    // risk path.
+    #[allow(deprecated)]
     // SAFETY: writing the MXCSR FTZ + DAZ bits is a thread-local CPU
     // state change with no Rust-visible side effects beyond the
     // intended floating-point behaviour.
     unsafe {
-        use std::arch::x86_64::{_MM_FLUSH_ZERO_ON, _MM_SET_FLUSH_ZERO_MODE};
+        use std::arch::x86_64::{
+            _MM_FLUSH_ZERO_ON, _MM_SET_FLUSH_ZERO_MODE, _mm_getcsr, _mm_setcsr,
+        };
         _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
         // DAZ lives in MXCSR bit 6; the safe intrinsic doesn't expose
         // it, so we set it via raw MXCSR read-modify-write.
-        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
         const MXCSR_DAZ: u32 = 1 << 6;
         let cur = _mm_getcsr();
         _mm_setcsr(cur | MXCSR_DAZ);
@@ -372,18 +380,12 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    #[allow(deprecated)] // _mm_getcsr deprecation tracked alongside set_ftz_daz
     fn first_callback_sets_ftz_and_daz_in_mxcsr() {
         use std::arch::x86_64::_mm_getcsr;
 
         // Reset the thread-local guard for this test thread.
         FTZ_DAZ_INITIALIZED.with(|f| f.set(false));
-
-        // Verify the bits are NOT set yet on a fresh test thread.
-        // (Tests run in their own threads under the libtest harness;
-        // FTZ/DAZ are per-thread CPU state.)
-        // We don't assert pre-state strictly: another test in the same
-        // thread may have already initialized. The point is the post-
-        // condition.
 
         let telemetry = Telemetry::new(1);
         let (mut producer, _consumer) = build_ring(48_000, 1, 200);
