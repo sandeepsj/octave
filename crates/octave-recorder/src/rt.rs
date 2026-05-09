@@ -12,11 +12,69 @@
 //!
 //! See `docs/modules/record-audio.md` §3.4 (RT path) and §5 (algorithms).
 
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 
 use rtrb::Producer;
 
 use crate::audio::Telemetry;
+
+// FTZ (Flush-To-Zero) and DAZ (Denormals-Are-Zero) make the audio
+// thread treat subnormal floats as zero. Plan §3.4 / §5.7: on legacy
+// hosts a single subnormal can blow the per-callback budget by 100×.
+// We set both flags once on first callback, per-thread, via a
+// thread-local guard. Cost: one branch + one atomic-relaxed test
+// per callback after the first.
+thread_local! {
+    static FTZ_DAZ_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline(always)]
+fn ensure_ftz_daz_set() {
+    FTZ_DAZ_INITIALIZED.with(|flag| {
+        if !flag.get() {
+            set_ftz_daz();
+            flag.set(true);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_ftz_daz() {
+    // SAFETY: writing the MXCSR FTZ + DAZ bits is a thread-local CPU
+    // state change with no Rust-visible side effects beyond the
+    // intended floating-point behaviour.
+    unsafe {
+        use std::arch::x86_64::{_MM_FLUSH_ZERO_ON, _MM_SET_FLUSH_ZERO_MODE};
+        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+        // DAZ lives in MXCSR bit 6; the safe intrinsic doesn't expose
+        // it, so we set it via raw MXCSR read-modify-write.
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        const MXCSR_DAZ: u32 = 1 << 6;
+        let cur = _mm_getcsr();
+        _mm_setcsr(cur | MXCSR_DAZ);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_ftz_daz() {
+    // SAFETY: writing the FPCR FZ bit is thread-local.
+    unsafe {
+        // FPCR bit 24 = FZ (flush-to-zero). aarch64 has no separate
+        // DAZ; FZ covers both inputs and outputs.
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr, options(nostack, preserves_flags));
+        fpcr |= 1 << 24;
+        std::arch::asm!("msr fpcr, {}", in(reg) fpcr, options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn set_ftz_daz() {
+    // Other architectures: no-op. Plan §3.4 mentions FTZ/DAZ for the
+    // architectures we ship to (x86_64 desktop, aarch64 macOS); on
+    // anything else, the audio thread runs without the optimization.
+}
 
 /// One audio-callback's worth of work.
 ///
@@ -35,6 +93,9 @@ pub(crate) fn process_input_buffer(
     telemetry: &Telemetry,
     producer: &mut Producer<f32>,
 ) {
+    // First-callback initialization (one branch + one cell read after this).
+    ensure_ftz_daz_set();
+
     if samples.is_empty() {
         return;
     }
@@ -307,6 +368,34 @@ mod tests {
         got.extend_from_slice(s2);
         chunk.commit_all();
         assert_eq!(got, buf);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn first_callback_sets_ftz_and_daz_in_mxcsr() {
+        use std::arch::x86_64::_mm_getcsr;
+
+        // Reset the thread-local guard for this test thread.
+        FTZ_DAZ_INITIALIZED.with(|f| f.set(false));
+
+        // Verify the bits are NOT set yet on a fresh test thread.
+        // (Tests run in their own threads under the libtest harness;
+        // FTZ/DAZ are per-thread CPU state.)
+        // We don't assert pre-state strictly: another test in the same
+        // thread may have already initialized. The point is the post-
+        // condition.
+
+        let telemetry = Telemetry::new(1);
+        let (mut producer, _consumer) = build_ring(48_000, 1, 200);
+        process_input_buffer(&[0.1_f32; 4], 1, &telemetry, &mut producer);
+
+        // SAFETY: _mm_getcsr is a thread-local CPU read, no side effects.
+        let mxcsr = unsafe { _mm_getcsr() };
+        const MXCSR_FTZ: u32 = 1 << 15;
+        const MXCSR_DAZ: u32 = 1 << 6;
+        assert_eq!(mxcsr & MXCSR_FTZ, MXCSR_FTZ, "FTZ bit set after first callback");
+        assert_eq!(mxcsr & MXCSR_DAZ, MXCSR_DAZ, "DAZ bit set after first callback");
+        assert!(FTZ_DAZ_INITIALIZED.with(Cell::get));
     }
 
     #[test]
