@@ -136,10 +136,12 @@ pub enum Command {
     /// back on failure — same shape as `octave-mcp::audio_actor`'s
     /// `start_session` helper). Returns the output path and started-
     /// at instant; the UI uses both to display "recording → /tmp/…
-    /// 0:03".
+    /// 0:03". `fold_to_mono` is honoured at Stop time (see
+    /// [`RecordingSession::fold_to_mono`]).
     StartRecording {
         spec: RecordingSpec,
         output_path: PathBuf,
+        fold_to_mono: bool,
         reply: oneshot::Sender<Result<RecordingStartReply, RecordingStartError>>,
     },
     StopRecording {
@@ -221,10 +223,17 @@ pub struct RecordingStatusSnapshot {
 }
 
 /// Internal — paired with the live RecordingHandle on the actor thread.
+/// `fold_to_mono` flips the post-stop WAV from "L=mic, R=silent" to
+/// "L=mic, R=mic" by overwriting each frame's right sample with the
+/// left. Captures the user's "I plug one mic into Input 1 of a 2-in
+/// interface" case — the most common setup. Engine still records
+/// stereo because cpal doesn't expose a 1-channel mode for most
+/// devices (e.g. Focusrite Solo reports channels: [2] only).
 struct RecordingSession {
     handle: RecordingHandle,
     output_path: PathBuf,
     started_at: Instant,
+    fold_to_mono: bool,
 }
 
 fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
@@ -303,13 +312,14 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
             Command::StartRecording {
                 spec,
                 output_path,
+                fold_to_mono,
                 reply,
             } => {
                 if recording.is_some() {
                     let _ = reply.send(Err(RecordingStartError::AlreadyRecording));
                     continue;
                 }
-                let result = start_recording(spec, output_path, &catalog);
+                let result = start_recording(spec, output_path, fold_to_mono, &catalog);
                 match result {
                     Ok((session, sample_rate, channels)) => {
                         let path = session.output_path.clone();
@@ -329,8 +339,34 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
                 let result = match recording.take() {
                     None => Err(RecordingStopError::NotRecording),
                     Some(mut session) => match session.handle.stop() {
-                        Ok(clip) => {
+                        Ok(mut clip) => {
                             session.handle.close();
+                            // Apply mono-fold AFTER the writer has
+                            // finalised the WAV (handle.stop() flushes
+                            // and closes the writer thread). Fold is a
+                            // no-op when channel count != 2 — covers
+                            // future devices that expose true 1-ch
+                            // capture and where we'd already have a
+                            // mono file.
+                            if session.fold_to_mono && clip.channels == 2 {
+                                if let Err(e) = fold_stereo_to_mono_left(&clip.path) {
+                                    eprintln!(
+                                        "warn: mono-fold post-process failed for {}: {} \
+                                         — clip stays stereo with right channel silent",
+                                        clip.path.display(),
+                                        e,
+                                    );
+                                } else {
+                                    // Update peak_dbfs's right-channel
+                                    // entry to mirror left so the UI
+                                    // doesn't show a dead R meter.
+                                    if let Some(left) = clip.peak_dbfs.first().copied() {
+                                        if let Some(right) = clip.peak_dbfs.get_mut(1) {
+                                            *right = left;
+                                        }
+                                    }
+                                }
+                            }
                             Ok(clip)
                         }
                         Err(e) => {
@@ -374,6 +410,7 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
 fn start_recording(
     spec: RecordingSpec,
     output_path: PathBuf,
+    fold_to_mono: bool,
     catalog: &DeviceCatalog,
 ) -> Result<(RecordingSession, u32, u16), RecordingStartError> {
     let sample_rate = spec.sample_rate;
@@ -393,8 +430,37 @@ fn start_recording(
             handle,
             output_path,
             started_at: Instant::now(),
+            fold_to_mono,
         },
         sample_rate,
         channels,
     ))
+}
+
+/// Mono-fold a 32-bit-float stereo WAV in-place: copy each frame's
+/// left sample into its right slot. Plays correctly through stereo
+/// devices on both ears even when only Input 1 of the interface had
+/// signal during capture.
+///
+/// Format assumptions: the file was written by `octave-recorder`
+/// (RIFF/RF64, IEEE-float 32-bit, 2 channels, interleaved L/R). We
+/// scan for the `data` chunk header rather than hard-coding a header
+/// length so format-tweaks in hound don't break this.
+fn fold_stereo_to_mono_left(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut bytes = std::fs::read(path)?;
+    let Some(idx) = bytes.windows(4).position(|w| w == b"data") else {
+        return Err(Error::new(ErrorKind::InvalidData, "no data chunk"));
+    };
+    // After "data" + 4-byte size = data chunk payload.
+    let data_start = idx + 8;
+    let frame_bytes = 8usize; // 2 channels × 4 bytes (f32)
+    let mut i = data_start;
+    while i + frame_bytes <= bytes.len() {
+        // copy_within is safe for non-overlapping slices in the same
+        // Vec; bytes[i..i+4] (left) → bytes[i+4..i+8] (right).
+        bytes.copy_within(i..i + 4, i + 4);
+        i += frame_bytes;
+    }
+    std::fs::write(path, bytes)
 }

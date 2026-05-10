@@ -357,10 +357,16 @@ fn generated_take_path() -> PathBuf {
     std::env::temp_dir().join(format!("octave-take-{millis}.wav"))
 }
 
+/// Open a recording session. `mono` is the channel-mode flag: `true`
+/// post-processes the resulting WAV to fold its right channel onto
+/// its left, so a single-mic capture (Input 1 only on a 2-input
+/// interface like the Focusrite Solo) plays through both ears on
+/// stereo devices. `false` keeps the raw L/R capture.
 #[tauri::command]
 async fn recording_start(
     actor: tauri::State<'_, AppActorHandle>,
     device_id: String,
+    mono: bool,
 ) -> Result<RecordingStartResult, String> {
     use octave_recorder::{BufferSize, DeviceId, RecordingSpec};
 
@@ -393,6 +399,7 @@ async fn recording_start(
         .send(Command::StartRecording {
             spec,
             output_path,
+            fold_to_mono: mono,
             reply: reply_tx,
         })
         .map_err(|e| format!("{e}"))?;

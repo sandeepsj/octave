@@ -151,6 +151,11 @@ export default function App() {
   const [recordedClip, setRecordedClip] = useState<RecordedClip | null>(null);
   const [recError, setRecError] = useState<string | null>(null);
   const [recBusy, setRecBusy] = useState(false);
+  // Default Mono — covers the common "one mic into Input 1 of a
+  // 2-input interface" case. The recorder always opens whatever the
+  // device exposes (typically stereo); when Mono is selected, the
+  // post-stop WAV is folded so R = L for both-ear playback.
+  const [recordMode, setRecordMode] = useState<"mono" | "stereo">("mono");
   const recPollTimer = useRef<number | null>(null);
 
   async function handleListDevices() {
@@ -195,6 +200,7 @@ export default function App() {
     try {
       const result = await invoke<RecordingStartResult>("recording_start", {
         deviceId: selectedInputDeviceId,
+        mono: recordMode === "mono",
       });
       setRecInfo(result);
       setRecStatus({ state: "Recording", elapsed_seconds: 0, xrun_count: 0 });
@@ -658,6 +664,38 @@ export default function App() {
         {selectedInputDeviceId && (
           <div className="mt-6">
             <div className="flex items-center gap-3">
+              {/* Mono / Stereo segmented control. Hidden mid-recording
+                  so the user can't change capture intent partway. */}
+              {!recInfo && (
+                <div className="inline-flex rounded-md border border-border overflow-hidden text-sm">
+                  <button
+                    type="button"
+                    onClick={() => setRecordMode("mono")}
+                    disabled={recBusy}
+                    className={`px-3 py-2 transition ${
+                      recordMode === "mono"
+                        ? "bg-accent text-black font-medium"
+                        : "bg-elevated text-muted hover:text-fg"
+                    }`}
+                    title="Single mic into Input 1 — fold capture so both ears hear it on playback."
+                  >
+                    Mono
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRecordMode("stereo")}
+                    disabled={recBusy}
+                    className={`px-3 py-2 transition border-l border-border ${
+                      recordMode === "stereo"
+                        ? "bg-accent text-black font-medium"
+                        : "bg-elevated text-muted hover:text-fg"
+                    }`}
+                    title="True stereo — Input 1 → L, Input 2 → R."
+                  >
+                    Stereo
+                  </button>
+                </div>
+              )}
               {!recInfo ? (
                 <button
                   type="button"
