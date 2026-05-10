@@ -21,11 +21,11 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use octave_recorder::{
-    ArmError, BufferSize, CancelError, DeviceId, OpenError, RecordError, RecordingHandle,
-    RecordingSpec, StopError,
+    ArmError, BufferSize, CancelError, DeviceCatalog as RecorderCatalog, DeviceId, OpenError,
+    RecordError, RecordingHandle, RecordingSpec, StopError,
 };
 
-use octave_player::{DeviceCatalog, PlaybackHandle, PlaybackSpec};
+use octave_player::{DeviceCatalog as PlayerCatalog, PlaybackHandle, PlaybackSpec};
 
 use crate::types::{
     LevelsResult, PlaybackSeekResult, PlaybackStatusJson, PlaybackTransportResult,
@@ -55,26 +55,34 @@ pub struct AudioActorHandle {
     join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Output-device catalog shared between read-only handler tools
     /// (`playback_list_output_devices`, `playback_describe_device`)
-    /// and the actor thread that calls `catalog.start(...)`. One Arc
+    /// and the actor thread that calls `playback.start(...)`. One Arc
     /// per actor instance — the cache it owns survives across all
     /// list / describe / start calls so `start` can reuse the
     /// `cpal::Device` from the most recent listing instead of
     /// re-enumerating (plan §3.3.1).
-    catalog: Arc<DeviceCatalog>,
+    playback: Arc<PlayerCatalog>,
+    /// Symmetric input-device catalog for the recorder side. Same
+    /// rationale as `playback` — `recording_list_devices` and
+    /// `recording_start` share this Arc so the cache survives across
+    /// list + open. See `record-audio` §3.3.1.
+    recorder: Arc<RecorderCatalog>,
 }
 
 impl AudioActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
-        let catalog = Arc::new(DeviceCatalog::new());
-        let actor_catalog = Arc::clone(&catalog);
+        let playback = Arc::new(PlayerCatalog::new());
+        let recorder = Arc::new(RecorderCatalog::new());
+        let actor_playback = Arc::clone(&playback);
+        let actor_recorder = Arc::clone(&recorder);
         let join = thread::Builder::new()
             .name("octave-mcp-audio".into())
-            .spawn(move || run_actor(rx, actor_catalog))?;
+            .spawn(move || run_actor(rx, actor_playback, actor_recorder))?;
         Ok(Self {
             tx: Some(tx),
             join: Arc::new(std::sync::Mutex::new(Some(join))),
-            catalog,
+            playback,
+            recorder,
         })
     }
 
@@ -89,11 +97,15 @@ impl AudioActorHandle {
         }
     }
 
-    /// Borrow the actor's [`DeviceCatalog`] for read-only tools
-    /// (listing / describing devices). The catalog is `Send + Sync`,
-    /// so concurrent tool calls share it safely.
-    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
-        &self.catalog
+    /// Borrow the actor's playback (output) catalog for read-only
+    /// tools. `Send + Sync`, safe to share across concurrent tool calls.
+    pub fn playback_catalog(&self) -> &Arc<PlayerCatalog> {
+        &self.playback
+    }
+
+    /// Borrow the actor's recorder (input) catalog for read-only tools.
+    pub fn recorder_catalog(&self) -> &Arc<RecorderCatalog> {
+        &self.recorder
     }
 }
 
@@ -262,10 +274,14 @@ struct ActorState {
     playback: Option<PlaybackSession>,
 }
 
-fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
+fn run_actor(
+    rx: Receiver<Command>,
+    playback: Arc<PlayerCatalog>,
+    recorder: Arc<RecorderCatalog>,
+) {
     let mut state = ActorState::default();
     while let Ok(cmd) = rx.recv() {
-        handle_command(cmd, &mut state, &catalog);
+        handle_command(cmd, &mut state, &playback, &recorder);
     }
     // Channel closed → drain and close everything.
     for (_, mut s) in state.recording.drain() {
@@ -278,14 +294,19 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn handle_command(cmd: Command, state: &mut ActorState, catalog: &DeviceCatalog) {
+fn handle_command(
+    cmd: Command,
+    state: &mut ActorState,
+    playback: &PlayerCatalog,
+    recorder: &RecorderCatalog,
+) {
     match cmd {
         Command::StartRecording {
             spec,
             output_path,
             reply,
         } => {
-            let _ = reply.send(start_session(spec, &output_path, &mut state.recording));
+            let _ = reply.send(start_session(spec, &output_path, &mut state.recording, recorder));
         }
         Command::Stop { session_id, reply } => {
             let result = match state.recording.remove(&session_id) {
@@ -366,7 +387,7 @@ fn handle_command(cmd: Command, state: &mut ActorState, catalog: &DeviceCatalog)
         //   Playback handlers
         // ============================================================
         Command::PlaybackStart { spec, reply } => {
-            let result = start_playback(spec, &mut state.playback, catalog);
+            let result = start_playback(spec, &mut state.playback, playback);
             let _ = reply.send(result);
         }
         Command::PlaybackPause { session_id, reply } => {
@@ -482,7 +503,7 @@ fn playback_transport(ps: &PlaybackSession) -> PlaybackTransportResult {
 fn start_playback(
     spec: PlaybackSpec,
     playback: &mut Option<PlaybackSession>,
-    catalog: &DeviceCatalog,
+    catalog: &PlayerCatalog,
 ) -> Result<PlaybackStartReply, PlaybackStartError> {
     if let Some(ps) = playback.as_ref() {
         return Err(PlaybackStartError::AlreadyPlaying {
@@ -513,12 +534,13 @@ fn start_session(
     spec: RecordingSpec,
     output_path: &std::path::Path,
     sessions: &mut HashMap<Uuid, Session>,
+    catalog: &RecorderCatalog,
 ) -> Result<StartReply, StartReplyError> {
     if sessions.len() >= MAX_SESSIONS {
         return Err(StartReplyError::TooManySessions);
     }
     let mut handle =
-        octave_recorder::open(spec.clone()).map_err(|e| StartReplyError::Open(open_err_str(&e)))?;
+        catalog.open(spec.clone()).map_err(|e| StartReplyError::Open(open_err_str(&e)))?;
     if let Err(e) = handle.arm() {
         handle.close();
         return Err(StartReplyError::Arm(arm_err_str(&e)));

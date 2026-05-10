@@ -150,7 +150,23 @@ let stream: cpal::Stream = device.build_input_stream(
 stream.play()?;
 ```
 
-We rely on cpal for: device enumeration (`Host::input_devices`), capability query (`Device::supported_input_configs`), stream construction with explicit `BufferSize::Fixed(n)`, and the ASIO build feature on Windows. We do **not** rely on cpal for sample-format conversion, error recovery, or anything beyond "give me f32 frames on the RT thread."
+We rely on cpal for: device enumeration (`Host::input_devices`), capability query (`Device::supported_input_configs`), stream construction with explicit `BufferSize::Fixed(n)`, and the ASIO build feature on Windows. We do **not** rely on cpal for sample-format conversion, error recovery, or anything beyond "give me native-format frames on the RT thread."
+
+#### 3.3.1 Sample-format conversion (mirror of [`playback-audio` §3.3.1](./playback-audio.md#331-device-handle-caching--devicecatalog) sibling)
+
+> [!IMPORTANT]
+> cpal's `build_input_stream::<f32>` does **not** auto-coerce devices that expose only integer formats. On Linux every physical `hw:CARD=` capture device is I32 or I16 native (USB-Audio is I32-only, HD-Audio is I16+I32). The recorder accepts F32, I32, and I16 input configs and converts in the input callback.
+
+Selection priority at stream-build time: F32 (no conversion) > I32 (full-precision integer) > I16. Internally the engine is f32 throughout (matches the on-disk WAV format and the meter atomics). The conversion happens in the cpal callback, before [`process_input_buffer`](#34-engine-layer--rt-side):
+
+$$
+\text{f32 from i32}(s) = s \cdot 2^{-31}
+$$
+$$
+\text{f32 from i16}(s) = s \cdot 2^{-15}
+$$
+
+Each integer path's closure owns a pre-allocated `Vec<f32>` scratch (sized at stream-build time, capped at `MAX_SCRATCH_FRAMES = 16384` frames per channel). Per callback: convert `&[T]` → scratch slice, then call `process_input_buffer(scratch_slice, …)`. No allocation, no syscall, no lock — RT-safe. If cpal ever hands a buffer larger than the scratch, the callback drops the buffer (treated as an xrun) rather than allocating in the RT path.
 
 > [!WARNING]
 > cpal's API is mostly stable but the `BufferSize` request is a *hint* on some backends (Core Audio, WASAPI shared mode). The plan budgets for the requested buffer size but verifies the actual size from the first callback's slice length.
@@ -216,12 +232,12 @@ State diagram in §11.
 | Format | Internal | On-disk (v1) |
 |---|---|---|
 | `f32` (IEEE-754 32-bit float) | ✅ Always | ✅ Always |
-| `i16` | Coerced to `f32` on input if device gives it (`x / 32768.0`) | ❌ |
-| `i24` (packed or aligned) | Coerced to `f32` (`x / 8388608.0`) | ❌ |
-| `i32` | Coerced to `f32` (`x / 2147483648.0`) | ❌ |
-| `f64` | Down-cast to `f32` (precision loss documented) | ❌ |
+| `i16` | Coerced to `f32` in the input callback (`x · 2^-15`) | ❌ |
+| `i24` (packed or aligned) | ❌ — cpal does not expose a typed-stream branch for i24 (it surfaces I32 padded into 32-bit slots instead, which we already handle) | ❌ |
+| `i32` | Coerced to `f32` in the input callback (`x · 2^-31`) | ❌ |
+| `f64` | ❌ — no real-world capture device exposes f64; would need a typed stream branch we don't ship | ❌ |
 
-Coercion happens in cpal's adapter layer; we see only `f32` slices on the audio thread. **Internal end-to-end is `f32`.**
+Coercion happens in **our** input callback (see [§3.3.1](#331-sample-format-conversion-mirror-of-playback-audio-331-sibling)) — cpal does not auto-coerce; `build_input_stream::<f32>` requires an F32-native device config. **Internal end-to-end is `f32`.**
 
 ### 4.2 Sample rates
 

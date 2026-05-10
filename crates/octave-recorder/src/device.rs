@@ -1,67 +1,127 @@
 //! Cross-platform device enumeration and capability query.
 //!
 //! Wraps cpal's `Host` / `Device` / `SupportedStreamConfigRange` API
-//! into the typed surface the public `list_devices`, `device_capabilities`,
-//! and `open` use. The `DeviceId` is encoded as `"{HOST_NAME}:{DEVICE_NAME}"`
-//! — opaque to callers, but stable enough that re-finding a device by id
-//! works as long as the name doesn't change between runs.
+//! into the typed surface used by [`DeviceCatalog`] (which also owns
+//! the cache that makes [`DeviceCatalog::open`] survive the PipeWire
+//! ALSA enumerate-race — see plan §3.3.1).
 //!
 //! See `docs/modules/record-audio.md` §3.2 (driver layer) and §3.3 (cpal).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
 use crate::{Backend, Capabilities, DeviceId, DeviceInfo, OpenError};
 
-/// Enumerate every input device on every cpal host the platform exposes.
+/// Owns the cached `cpal::Device` handles from the most recent
+/// `list_devices()` call. Mirror of `octave_player::DeviceCatalog` —
+/// see plan §3.3.1 for the rationale: cpal's ALSA backend probes
+/// devices by `snd_pcm_open`, which loses to PipeWire's exclusive
+/// grab between list and open. By retaining the `cpal::Device` we
+/// keep the underlying ALSA PCM open and `open()` can re-find the
+/// device by id without re-enumerating.
 ///
-/// Devices whose `supported_input_configs` query fails are **skipped**
-/// (with a `tracing::warn`) rather than being surfaced with
-/// `max_input_channels = 0` — the latter looks like a broken device to
-/// UI/agents and hides the underlying probe failure.
-pub(crate) fn list_devices_impl() -> Vec<DeviceInfo> {
-    let mut out = Vec::new();
-    for host_id in cpal::available_hosts() {
-        let Ok(host) = cpal::host_from_id(host_id) else { continue };
-        let backend = host_id_to_backend(host_id);
-        let default_name = host
-            .default_input_device()
-            .and_then(|d| d.name().ok());
-        let Ok(devices) = host.input_devices() else { continue };
-        for device in devices {
-            let Ok(name) = device.name() else { continue };
-            let max_input_channels = match device.supported_input_configs() {
-                Ok(iter) => iter.map(|c| c.channels()).max().unwrap_or(0),
-                Err(e) => {
-                    tracing::warn!(
-                        device = %name,
-                        error = %e,
-                        "supported_input_configs failed; skipping device"
-                    );
-                    continue;
-                }
-            };
-            let id = DeviceId(encode_id(host_id, &name));
-            let is_default_input = default_name.as_deref() == Some(name.as_str());
-            out.push(DeviceInfo {
-                id,
-                name,
-                backend: backend.clone(),
-                is_default_input,
-                // Class-compliant USB detection requires udev / IOKit / WinUSB
-                // queries that are out of scope for v0.1.
-                is_class_compliant_usb: false,
-                max_input_channels,
-            });
-        }
-    }
-    out
+/// `Send + Sync` (the inner `Mutex<HashMap<…, cpal::Device>>` is, on
+/// every backend Octave targets — see plan §3.3.1 for the per-backend
+/// proof).
+pub struct DeviceCatalog {
+    devices: Mutex<HashMap<DeviceId, cpal::Device>>,
 }
 
-/// Query one device's capabilities by id.
-pub(crate) fn capabilities_impl(id: &DeviceId) -> Result<Capabilities, OpenError> {
-    let device = find_device(id)?;
+impl DeviceCatalog {
+    pub fn new() -> Self {
+        Self {
+            devices: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Enumerate every input device on every cpal host the platform
+    /// exposes. Replaces the cache with a fresh map of cpal::Device
+    /// handles; entries that disappeared since the previous call are
+    /// dropped (releasing their underlying ALSA refs). Subsequent
+    /// `open()` calls will use these cached handles.
+    ///
+    /// Devices whose `supported_input_configs` query fails are
+    /// **skipped** (with a `tracing::warn`) rather than being surfaced
+    /// with `max_input_channels = 0` — the latter looks like a broken
+    /// device to UI/agents and hides the underlying probe failure.
+    pub fn list_devices(&self) -> Vec<DeviceInfo> {
+        let mut out = Vec::new();
+        let mut new_cache: HashMap<DeviceId, cpal::Device> = HashMap::new();
+        for host_id in cpal::available_hosts() {
+            let Ok(host) = cpal::host_from_id(host_id) else { continue };
+            let backend = host_id_to_backend(host_id);
+            let default_name = host
+                .default_input_device()
+                .and_then(|d| d.name().ok());
+            let Ok(devices) = host.input_devices() else { continue };
+            for device in devices {
+                let Ok(name) = device.name() else { continue };
+                let max_input_channels = match device.supported_input_configs() {
+                    Ok(iter) => iter.map(|c| c.channels()).max().unwrap_or(0),
+                    Err(e) => {
+                        tracing::warn!(
+                            device = %name,
+                            error = %e,
+                            "supported_input_configs failed; skipping device"
+                        );
+                        continue;
+                    }
+                };
+                let id = DeviceId(encode_id(host_id, &name));
+                let is_default_input = default_name.as_deref() == Some(name.as_str());
+                new_cache.insert(id.clone(), device);
+                out.push(DeviceInfo {
+                    id,
+                    name,
+                    backend: backend.clone(),
+                    is_default_input,
+                    // Class-compliant USB detection requires udev / IOKit / WinUSB
+                    // queries that are out of scope for v0.1.
+                    is_class_compliant_usb: false,
+                    max_input_channels,
+                });
+            }
+        }
+        // Mutex poisoning here would mean a previous holder panicked
+        // mid-update; recover by overwriting the inner map with the
+        // fresh enumeration.
+        let mut guard = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = new_cache;
+        out
+    }
+
+    /// Query one device's capabilities by id. Cache-first; falls back
+    /// to fresh enumeration on miss (so callers that supply a
+    /// remembered id without listing first still work).
+    pub fn device_capabilities(&self, id: &DeviceId) -> Result<Capabilities, OpenError> {
+        let device = self.find_device(id)?;
+        capabilities_for_device(&device)
+    }
+
+    /// Re-find a device on its host by encoded id. Cache-first (see
+    /// plan §3.3.1); enumerate on miss.
+    pub(crate) fn find_device(&self, id: &DeviceId) -> Result<cpal::Device, OpenError> {
+        if let Some(d) = self
+            .devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            return Ok(d.clone());
+        }
+        find_device_via_enum(id)
+    }
+}
+
+impl Default for DeviceCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn capabilities_for_device(device: &cpal::Device) -> Result<Capabilities, OpenError> {
     let supported = device
         .supported_input_configs()
         .map_err(|e| OpenError::BackendError(format!("supported_input_configs: {e}")))?;
@@ -135,8 +195,9 @@ fn clamp_default_buffer_size(min: u32, max: u32) -> u32 {
     PREFERRED.clamp(min, max.max(min))
 }
 
-/// Re-find a device on its host by encoded id.
-pub(crate) fn find_device(id: &DeviceId) -> Result<cpal::Device, OpenError> {
+/// Re-find a device on its host by encoded id. Cache-miss fallback
+/// — see [`DeviceCatalog::find_device`].
+fn find_device_via_enum(id: &DeviceId) -> Result<cpal::Device, OpenError> {
     let (host_str, dev_name) = decode_id(&id.0)
         .ok_or_else(|| OpenError::DeviceNotFound { id: id.clone() })?;
     let host_id = cpal::available_hosts()
@@ -180,8 +241,8 @@ mod tests {
 
     #[test]
     fn list_devices_does_not_panic() {
-        // CI machines may have zero audio devices; we only assert no panic.
-        let _ = list_devices_impl();
+        let catalog = DeviceCatalog::new();
+        let _ = catalog.list_devices();
     }
 
     #[test]
@@ -198,12 +259,75 @@ mod tests {
 
     #[test]
     fn unknown_id_returns_device_not_found() {
+        // Fresh catalog → cache miss → enumeration fallback → not found.
+        let catalog = DeviceCatalog::new();
         let bogus = DeviceId("NOPE:not-a-real-device-87b5e".into());
-        match find_device(&bogus) {
+        match catalog.find_device(&bogus) {
             Err(OpenError::DeviceNotFound { .. }) => {}
             Err(other) => panic!("expected DeviceNotFound, got {other:?}"),
             Ok(_) => panic!("expected DeviceNotFound, got Ok(device)"),
         }
+    }
+
+    #[test]
+    fn list_then_find_via_cache_succeeds() {
+        // Mirror of octave-player's analogous test: any device that
+        // came back from `list_devices` must be re-findable without
+        // enumeration (which would race with PipeWire's exclusive
+        // grab on Linux).
+        let catalog = DeviceCatalog::new();
+        let listed = catalog.list_devices();
+        for info in &listed {
+            catalog
+                .find_device(&info.id)
+                .expect("a just-listed device must be findable");
+        }
+    }
+
+    #[test]
+    fn relisting_replaces_the_cache_not_merging_into_it() {
+        // Smuggle a known-fake key into the cache by stealing a real
+        // `cpal::Device` from the first listing. After a second
+        // `list_devices` the fake key must be gone — proves the cache
+        // is REPLACED, not merged (a merge would silently leak handles
+        // to vanished devices).
+        let catalog = DeviceCatalog::new();
+        catalog.list_devices();
+        let stolen_device = {
+            let guard = catalog.devices.lock().unwrap();
+            guard.values().next().cloned()
+        };
+        let fake_id = DeviceId("ALSA:no-such-device-marker-only-for-this-test".into());
+        if let Some(d) = stolen_device {
+            catalog.devices.lock().unwrap().insert(fake_id.clone(), d);
+            assert!(
+                catalog.devices.lock().unwrap().contains_key(&fake_id),
+                "test setup: fake key should be in the cache before re-list"
+            );
+        } else {
+            // CI host with zero devices — nothing to steal; skip the
+            // eviction half rather than asserting on absent state.
+            return;
+        }
+
+        let second = catalog.list_devices();
+        let second_ids: std::collections::HashSet<_> =
+            second.iter().map(|d| d.id.clone()).collect();
+        let cache_ids: std::collections::HashSet<_> = catalog
+            .devices
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            second_ids, cache_ids,
+            "after re-list, cache must contain exactly the second listing",
+        );
+        assert!(
+            !cache_ids.contains(&fake_id),
+            "fake key from before re-list must have been evicted",
+        );
     }
 
     #[test]
@@ -213,31 +337,24 @@ mod tests {
 
     #[test]
     fn clamp_default_buffer_size_clamps_up_when_min_exceeds_256() {
-        // Some pro interfaces report a minimum > 256.
         assert_eq!(clamp_default_buffer_size(512, 8192), 512);
     }
 
     #[test]
     fn clamp_default_buffer_size_clamps_down_when_max_below_256() {
-        // Embedded backends with a tiny ceiling.
         assert_eq!(clamp_default_buffer_size(16, 128), 128);
     }
 
     #[test]
     fn clamp_default_buffer_size_unknown_range_returns_256() {
-        // Both 0 means cpal didn't report a range — keep the historical default.
         assert_eq!(clamp_default_buffer_size(0, 0), 256);
     }
 
     #[test]
     fn host_id_to_backend_unknown_host_yields_other_not_alsa() {
-        // We can't fabricate a cpal::HostId in tests, but we can prove the
-        // exhaustiveness intent: every documented host name maps to its
-        // expected variant, and nothing else collapses to Alsa silently.
-        // Direct construction of HostId isn't public; instead, the variant
-        // exists and the only path to it is the catch-all arm — covered by
-        // build-time exhaustiveness.
-        // Placeholder assertion to keep the intent visible in test output.
+        // We can't fabricate a cpal::HostId in tests, but the variant
+        // exists and the only path to it is the catch-all arm —
+        // covered by build-time exhaustiveness.
         assert!(matches!(Backend::Other("sndio".into()), Backend::Other(_)));
     }
 }

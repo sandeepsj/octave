@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use octave_recorder::{BufferSize, RecordingSpec, device_capabilities, list_devices, open};
+use octave_recorder::{BufferSize, DeviceCatalog, RecordingSpec};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -28,7 +28,12 @@ fn main() -> ExitCode {
     let output_path = PathBuf::from(&args[1]);
     let duration_s: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5.0);
 
-    let devices = list_devices();
+    // One catalog for the lifetime of the demo. `list_devices`
+    // populates the device-handle cache; `open` reuses it (plan
+    // §3.3.1) so the demo doesn't lose to PipeWire's ALSA exclusive-
+    // grab race.
+    let catalog = DeviceCatalog::new();
+    let devices = catalog.list_devices();
     if devices.is_empty() {
         eprintln!("no input devices found");
         return ExitCode::from(2);
@@ -49,7 +54,7 @@ fn main() -> ExitCode {
         .unwrap_or(&devices[0]);
     println!("\nopening default: {}", default.name);
 
-    let caps = match device_capabilities(&default.id) {
+    let caps = match catalog.device_capabilities(&default.id) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("device_capabilities failed: {e}");
@@ -74,7 +79,7 @@ fn main() -> ExitCode {
     };
     println!("  using: {sample_rate} Hz, {channels} ch, default buffer\n");
 
-    let mut handle = match open(spec) {
+    let mut handle = match catalog.open(spec) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("open failed: {e}");

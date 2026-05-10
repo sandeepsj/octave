@@ -92,7 +92,10 @@ impl OctaveServer {
         description = "Enumerate every input device the host can see across all backends. Returns an array with each device's stable id, human name, backend, default-input flag, and channel count. Safe and read-only."
     )]
     async fn recording_list_devices(&self) -> Result<Json<ListDevicesResult>, ErrorData> {
-        let devices = octave_recorder::list_devices()
+        let devices = self
+            .actor
+            .recorder_catalog()
+            .list_devices()
             .into_iter()
             .map(DeviceInfoJson::from)
             .collect();
@@ -108,7 +111,7 @@ impl OctaveServer {
         Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
     ) -> Result<Json<CapabilitiesJson>, ErrorData> {
         let id = octave_recorder::DeviceId(device_id);
-        match octave_recorder::device_capabilities(&id) {
+        match self.actor.recorder_catalog().device_capabilities(&id) {
             Ok(c) => Ok(Json(c.into())),
             Err(e) => Err(ErrorData::invalid_params(format_typed_error("OpenError", &e), None)),
         }
@@ -293,7 +296,7 @@ impl OctaveServer {
     ) -> Result<Json<ListOutputDevicesResult>, ErrorData> {
         let devices = self
             .actor
-            .catalog()
+            .playback_catalog()
             .list_output_devices()
             .into_iter()
             .map(OutputDeviceInfoJson::from)
@@ -310,7 +313,7 @@ impl OctaveServer {
         Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
     ) -> Result<Json<CapabilitiesJson>, ErrorData> {
         let id = octave_player::DeviceId(device_id);
-        match self.actor.catalog().output_device_capabilities(&id) {
+        match self.actor.playback_catalog().output_device_capabilities(&id) {
             Ok(c) => Ok(Json(c.into())),
             Err(e) => Err(ErrorData::invalid_params(
                 format_typed_error("DeviceError", &e),

@@ -19,7 +19,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use rtrb::Consumer;
 use uuid::Uuid;
 
-use crate::device::{capabilities_impl, find_device};
+use crate::device::DeviceCatalog;
 use crate::ring::{DEFAULT_HEADROOM_MS, build_ring};
 use crate::rt::process_input_buffer;
 use crate::state::RecorderState;
@@ -118,6 +118,38 @@ const FLOOR_LINEAR: f32 = 1e-9;
 const MIN_PERIOD_MS: f32 = 0.5;
 const MAX_PERIOD_MS: f32 = 100.0;
 
+/// Per-channel scratch ceiling for the I32 / I16 conversion paths
+/// (mirror of octave-player's MAX_SCRATCH_FRAMES). 16 384 frames is
+/// ~341 ms at 48 kHz — well above any realistic cpal callback. If
+/// cpal ever exceeds this, the input callback drops the buffer (as
+/// an xrun) rather than allocating in the RT path.
+const MAX_SCRATCH_FRAMES: usize = 16_384;
+
+// 2^-31 and 2^-15 are pure powers of two well inside the f32 exponent
+// range, so they're bit-exact in f32 despite clippy's general
+// `lossy_float_literal` heuristic flagging the decimal literals.
+// Multiplying by these reciprocals is exact and lets the compiler
+// skip the divide.
+#[allow(clippy::lossy_float_literal)]
+const I32_TO_F32_SCALE: f32 = 1.0_f32 / 2_147_483_648.0_f32;
+#[allow(clippy::lossy_float_literal)]
+const I16_TO_F32_SCALE: f32 = 1.0_f32 / 32_768.0_f32;
+
+/// i32 -> f32: scale by 2^-31 so [i32::MIN, i32::MAX] maps to
+/// [-1.0, 1.0]. Pure, allocation-free. Per plan §3.3.1.
+#[inline]
+#[allow(clippy::cast_precision_loss)]
+fn i32_to_f32(s: i32) -> f32 {
+    s as f32 * I32_TO_F32_SCALE
+}
+
+/// i16 -> f32: scale by 2^-15 so [i16::MIN, i16::MAX] maps to
+/// [-1.0, 1.0].
+#[inline]
+fn i16_to_f32(s: i16) -> f32 {
+    f32::from(s) * I16_TO_F32_SCALE
+}
+
 /// xrun detection tolerance — plan §3.4 / §8 say "gap > 1 period";
 /// in practice timing jitter routinely produces gaps slightly above
 /// 1 period without dropping a frame, so we use 1.5 periods as the
@@ -200,11 +232,24 @@ fn is_metering_state(state: RecorderState) -> bool {
     )
 }
 
-/// Public entry point: open a device, build the cpal stream (parked), and
-/// return an [`Idle`](RecorderState::Idle) handle ready to be `arm`ed.
-pub fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
-    let device = find_device(&spec.device_id)?;
-    let caps = capabilities_impl(&spec.device_id)?;
+impl DeviceCatalog {
+    /// Open a device, build the cpal stream (parked), and return an
+    /// [`Idle`](RecorderState::Idle) handle ready to be `arm`ed. Uses
+    /// the cached `cpal::Device` for `spec.device_id` when present
+    /// (i.e. when this catalog has called [`Self::list_devices`] since
+    /// startup) — see plan §3.3.1. Cache miss falls through to fresh
+    /// enumeration.
+    pub fn open(&self, spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
+        open_inner(self, spec)
+    }
+}
+
+/// Body of [`DeviceCatalog::open`]; lives outside the `impl` block so
+/// the existing `?` cascade keeps its compact `(spec, caps)` ownership
+/// shape without nesting it inside an `impl … { fn …` indent.
+fn open_inner(catalog: &DeviceCatalog, spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
+    let device = catalog.find_device(&spec.device_id)?;
+    let caps = catalog.device_capabilities(&spec.device_id)?;
 
     if !caps.channels.contains(&spec.channels)
         || spec.sample_rate < caps.min_sample_rate
@@ -228,21 +273,38 @@ pub fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
         });
     }
 
-    // Pick the f32-format config that matches the requested rate + channels.
+    // Pick a config matching the requested rate + channels. Preferred
+    // formats (in order): F32 (no conversion), I32 (full-precision
+    // integer), I16. See plan §3.3.1 — every Linux hw:CARD= capture
+    // device is I32 or I16; F32 only appears on PipeWire/dmix bridge
+    // devices and on macOS / Windows defaults.
     let supported = device
         .supported_input_configs()
         .map_err(|e| OpenError::BackendError(format!("supported_input_configs: {e}")))?;
-    let chosen = supported
-        .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == spec.channels)
-        .find(|c| {
+    let mut acceptable: Vec<_> = supported
+        .filter(|c| c.channels() == spec.channels)
+        .filter(|c| {
             c.min_sample_rate().0 <= spec.sample_rate && c.max_sample_rate().0 >= spec.sample_rate
-        });
-    if chosen.is_none() {
+        })
+        .filter(|c| {
+            matches!(
+                c.sample_format(),
+                cpal::SampleFormat::F32 | cpal::SampleFormat::I32 | cpal::SampleFormat::I16
+            )
+        })
+        .collect();
+    acceptable.sort_by_key(|c| match c.sample_format() {
+        cpal::SampleFormat::F32 => 0,
+        cpal::SampleFormat::I32 => 1,
+        cpal::SampleFormat::I16 => 2,
+        _ => 3,
+    });
+    let Some(chosen) = acceptable.into_iter().next() else {
         return Err(OpenError::FormatUnsupported {
             requested: Box::new(spec),
             supported: Box::new(caps),
         });
-    }
+    };
 
     // Validate buffer_size:
     //   1. Against the device's reported [min, max] range (caps).
@@ -275,47 +337,136 @@ pub fn open(spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
 
     let (mut producer, consumer) = build_ring(spec.sample_rate, spec.channels, DEFAULT_HEADROOM_MS);
     let telemetry = Telemetry::new(spec.channels);
-    let telemetry_cb = telemetry.clone();
     let telemetry_err_cb = telemetry.clone();
     let channels_cb = spec.channels;
     let sample_rate_cb = spec.sample_rate;
+    let scratch_size = MAX_SCRATCH_FRAMES * usize::from(spec.channels);
+    // Single error closure shared by all three sample-format branches.
+    // Classifies the cpal stream error so the failure mode is
+    // observable beyond log lines (plan §8 — device unplugged,
+    // backend hiccup, etc.).
+    let err_cb = move |err: cpal::StreamError| match &err {
+        cpal::StreamError::DeviceNotAvailable => {
+            tracing::error!("cpal: input device went away");
+            telemetry_err_cb.errored.store(true, Ordering::Release);
+        }
+        cpal::StreamError::BackendSpecific { err: be } => {
+            tracing::warn!(error = %be, "cpal: backend-specific stream error (counted as xrun)");
+            // Not necessarily fatal; bump xrun_count so the user sees
+            // something. If it recurs the failure mode itself becomes
+            // obvious.
+            telemetry_err_cb.xrun_count.fetch_add(1, Ordering::Relaxed);
+        }
+    };
 
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |samples: &[f32], info: &cpal::InputCallbackInfo| {
-                assert_no_alloc::assert_no_alloc(|| {
-                    detect_xrun_from_capture_timestamp(
-                        info,
-                        samples.len(),
-                        channels_cb,
-                        sample_rate_cb,
-                        &telemetry_cb,
-                    );
-                    process_input_buffer(samples, channels_cb, &telemetry_cb, &mut producer);
-                });
-            },
-            move |err| {
-                // Classify the cpal stream error so the failure mode is
-                // observable beyond log lines (plan §8 — device unplugged,
-                // backend hiccup, etc.).
-                match &err {
-                    cpal::StreamError::DeviceNotAvailable => {
-                        tracing::error!("cpal: input device went away");
-                        telemetry_err_cb.errored.store(true, Ordering::Release);
-                    }
-                    cpal::StreamError::BackendSpecific { err: be } => {
-                        tracing::warn!(error = %be, "cpal: backend-specific stream error (counted as xrun)");
-                        // Not necessarily fatal; bump xrun_count so the
-                        // user sees something. If it recurs the failure
-                        // mode itself becomes obvious.
-                        telemetry_err_cb.xrun_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            },
-            None,
-        )
-        .map_err(|e| OpenError::BackendError(format!("build_input_stream: {e}")))?;
+    let stream = match chosen.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let telemetry_cb = telemetry.clone();
+            device
+                .build_input_stream(
+                    &stream_config,
+                    move |samples: &[f32], info: &cpal::InputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            detect_xrun_from_capture_timestamp(
+                                info,
+                                samples.len(),
+                                channels_cb,
+                                sample_rate_cb,
+                                &telemetry_cb,
+                            );
+                            process_input_buffer(samples, channels_cb, &telemetry_cb, &mut producer);
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| OpenError::BackendError(format!("build_input_stream: {e}")))?
+        }
+        cpal::SampleFormat::I32 => {
+            let telemetry_cb = telemetry.clone();
+            let mut scratch = vec![0.0_f32; scratch_size];
+            device
+                .build_input_stream(
+                    &stream_config,
+                    move |samples: &[i32], info: &cpal::InputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            let n = samples.len();
+                            // Always charge the xrun-detector for the
+                            // observed slice length, even if we then
+                            // drop the buffer because it overflows
+                            // scratch — the timestamp logic counts
+                            // physical samples, not logical ones.
+                            detect_xrun_from_capture_timestamp(
+                                info,
+                                n,
+                                channels_cb,
+                                sample_rate_cb,
+                                &telemetry_cb,
+                            );
+                            if n > scratch.len() {
+                                // Treat oversize buffers as xruns; the
+                                // alternative would be allocating in
+                                // the RT path. Should never fire with
+                                // BufferSize::Default; if a future
+                                // BufferSize::Fixed asks for more we
+                                // catch it at config-time below.
+                                telemetry_cb.xrun_count.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                            let work = &mut scratch[..n];
+                            for (dst, src) in work.iter_mut().zip(samples.iter()) {
+                                *dst = i32_to_f32(*src);
+                            }
+                            process_input_buffer(work, channels_cb, &telemetry_cb, &mut producer);
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| OpenError::BackendError(format!("build_input_stream: {e}")))?
+        }
+        cpal::SampleFormat::I16 => {
+            let telemetry_cb = telemetry.clone();
+            let mut scratch = vec![0.0_f32; scratch_size];
+            device
+                .build_input_stream(
+                    &stream_config,
+                    move |samples: &[i16], info: &cpal::InputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            let n = samples.len();
+                            detect_xrun_from_capture_timestamp(
+                                info,
+                                n,
+                                channels_cb,
+                                sample_rate_cb,
+                                &telemetry_cb,
+                            );
+                            if n > scratch.len() {
+                                telemetry_cb.xrun_count.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                            let work = &mut scratch[..n];
+                            for (dst, src) in work.iter_mut().zip(samples.iter()) {
+                                *dst = i16_to_f32(*src);
+                            }
+                            process_input_buffer(work, channels_cb, &telemetry_cb, &mut producer);
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| OpenError::BackendError(format!("build_input_stream: {e}")))?
+        }
+        // The `acceptable` filter rejects any other format; reachable
+        // only if cpal grows a new variant we forgot to filter.
+        other => {
+            tracing::error!(?other, "unexpected sample format slipped past filter");
+            return Err(OpenError::FormatUnsupported {
+                requested: Box::new(spec),
+                supported: Box::new(caps),
+            });
+        }
+    };
 
     Ok(RecordingHandle {
         inner: Internals {
@@ -584,6 +735,51 @@ impl RecordingHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- i32 / i16 -> f32 conversion ----------
+
+    #[test]
+    fn i32_to_f32_silence_is_zero() {
+        assert_eq!(i32_to_f32(0), 0.0);
+    }
+
+    #[test]
+    fn i32_to_f32_min_is_negative_unity() {
+        // i32::MIN = -2^31; * 2^-31 = -1.0 exactly.
+        assert_eq!(i32_to_f32(i32::MIN), -1.0);
+    }
+
+    #[test]
+    fn i32_to_f32_max_is_just_under_unity() {
+        // i32::MAX = 2^31 - 1; one LSB below unity is below f32
+        // mantissa precision at the +1.0 exponent boundary so the
+        // result rounds to exactly 1.0 — acceptable, ±1 LSB at full
+        // scale is inaudible.
+        let got = i32_to_f32(i32::MAX);
+        assert!(
+            (got - 1.0).abs() < 1e-7,
+            "i32::MAX should map to ~1.0, got {got}"
+        );
+    }
+
+    #[test]
+    fn i16_to_f32_silence_min_max() {
+        assert_eq!(i16_to_f32(0), 0.0);
+        assert_eq!(i16_to_f32(i16::MIN), -1.0); // -32768 * 2^-15 = -1.0 exactly
+        // i16::MAX = 32767; (32767 / 32768) is representable in f32 — not 1.0.
+        let got = i16_to_f32(i16::MAX);
+        assert!(
+            (got - (32767.0_f32 / 32768.0_f32)).abs() < 1e-7,
+            "i16::MAX should map to 32767/32768, got {got}"
+        );
+    }
+
+    #[test]
+    fn i32_to_f32_half_scale_is_exact() {
+        // 2^30 / 2^31 = 0.5 exactly (both representable in f32).
+        assert_eq!(i32_to_f32(1 << 30), 0.5);
+        assert_eq!(i32_to_f32(-(1 << 30)), -0.5);
+    }
 
     #[test]
     fn dbfs_floor_clamps_silence_to_minus_180() {

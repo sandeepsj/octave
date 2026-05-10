@@ -40,7 +40,7 @@ mod writer;
 #[cfg(test)]
 mod test_support;
 
-pub use audio::open;
+pub use device::DeviceCatalog;
 pub use error::{ArmError, CancelError, OpenError, RecordError, StopError};
 pub use state::RecorderState;
 
@@ -128,16 +128,10 @@ pub struct RecordingHandle {
     inner: audio::Internals,
 }
 
-/// Enumerate every input device the host knows about, across every backend
-/// the platform exposes.
-pub fn list_devices() -> Vec<DeviceInfo> {
-    device::list_devices_impl()
-}
-
-/// Ask one device about its supported sample rates, buffer sizes, and channel counts.
-pub fn device_capabilities(id: &DeviceId) -> Result<Capabilities, OpenError> {
-    device::capabilities_impl(id)
-}
+// `list_devices`, `device_capabilities`, and `open` are methods on
+// `DeviceCatalog` (see device.rs). Holding the catalog across list +
+// open is what defeats the cpal-on-ALSA enumerate-race that
+// PipeWire's exclusive PCM grab triggers — see plan §3.3.1.
 
 // `RecordingHandle` methods (`arm`, `record`, `stop`, `cancel`,
 // `peak_dbfs`, `rms_dbfs`, `xrun_count`, `dropped_samples`, `state`,
