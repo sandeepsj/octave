@@ -19,7 +19,10 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tokio::sync::oneshot;
 
-use octave_player::{DeviceCatalog, PlaybackHandle, PlaybackSpec, PlaybackStatus};
+use octave_player::{
+    DeviceCatalog as PlayerCatalog, PlaybackHandle, PlaybackSpec, PlaybackStatus,
+};
+use octave_recorder::DeviceCatalog as RecorderCatalog;
 
 /// Bounded so a runaway producer can't grow the queue without limit.
 /// 16 is plenty: the UI sends one command per click, the actor
@@ -37,25 +40,34 @@ pub struct AppActorHandle {
     join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Output-device catalog shared between the synchronous
     /// `list_output_devices` Tauri command and the actor thread that
-    /// calls `catalog.start(...)`. Holding the same catalog across
+    /// calls `playback.start(...)`. Holding the same catalog across
     /// list and start is what defeats the PipeWire ALSA enumerate-race
     /// (plan §3.3.1) — `start` reuses the cpal::Device the listing
     /// already opened.
-    catalog: Arc<DeviceCatalog>,
+    playback: Arc<PlayerCatalog>,
+    /// Symmetric input-device catalog for the recorder side. Same
+    /// rationale as `playback`. Currently only feeds the read-only
+    /// `list_input_devices` Tauri command — the actor doesn't yet
+    /// own a recording session (record affordance is the next cycle
+    /// step), but the catalog lives here so the future `record_*`
+    /// commands and the listing share the same cached handles.
+    recorder: Arc<RecorderCatalog>,
 }
 
 impl AppActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
-        let catalog = Arc::new(DeviceCatalog::new());
-        let actor_catalog = Arc::clone(&catalog);
+        let playback = Arc::new(PlayerCatalog::new());
+        let recorder = Arc::new(RecorderCatalog::new());
+        let actor_playback = Arc::clone(&playback);
         let join = thread::Builder::new()
             .name("octave-app-audio".into())
-            .spawn(move || run_actor(rx, actor_catalog))?;
+            .spawn(move || run_actor(rx, actor_playback))?;
         Ok(Self {
             tx: Some(tx),
             join: Arc::new(std::sync::Mutex::new(Some(join))),
-            catalog,
+            playback,
+            recorder,
         })
     }
 
@@ -68,11 +80,17 @@ impl AppActorHandle {
         }
     }
 
-    /// Borrow the actor's [`DeviceCatalog`] for the read-only
-    /// `list_output_devices` Tauri command. The catalog is `Send + Sync`,
-    /// so concurrent commands share it safely.
-    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
-        &self.catalog
+    /// Borrow the actor's playback (output) catalog for the read-only
+    /// `list_output_devices` Tauri command. `Send + Sync`, safe to
+    /// share across concurrent commands.
+    pub fn playback_catalog(&self) -> &Arc<PlayerCatalog> {
+        &self.playback
+    }
+
+    /// Borrow the actor's recorder (input) catalog for the read-only
+    /// `list_input_devices` Tauri command.
+    pub fn recorder_catalog(&self) -> &Arc<RecorderCatalog> {
+        &self.recorder
     }
 }
 
@@ -151,7 +169,7 @@ pub enum PlaybackTransportError {
     Transport(String),
 }
 
-fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
+fn run_actor(rx: Receiver<Command>, catalog: Arc<PlayerCatalog>) {
     let mut active: Option<PlaybackHandle> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {

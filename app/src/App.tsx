@@ -2,18 +2,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-/// Mirror of the Tauri command's return shape (defined in
-/// app/src-tauri/src/lib.rs — keep in sync).
-interface OutputDeviceInfo {
-  device_id: string;
+/// Fields shared between input and output device info — used by the
+/// `isEssential` filter and the `prettify` rewriter. Both Tauri
+/// commands (`list_output_devices`, `list_input_devices`) return
+/// objects compatible with this shape.
+interface DeviceCommon {
   name: string;
   /// Linux-only: the human-readable name from /proc/asound/cards
   /// (e.g. "Focusrite Scarlett Solo USB"). Other platforms always
   /// null — Core Audio / WASAPI hand the friendly name in `name`.
   friendly_name: string | null;
   backend: string;
+}
+
+/// Mirror of the Tauri command's return shape (defined in
+/// app/src-tauri/src/lib.rs — keep in sync).
+interface OutputDeviceInfo extends DeviceCommon {
+  device_id: string;
   is_default_output: boolean;
   max_output_channels: number;
+}
+
+interface InputDeviceInfo extends DeviceCommon {
+  device_id: string;
+  is_default_input: boolean;
+  max_input_channels: number;
 }
 
 interface PlaybackStartResult {
@@ -55,7 +68,7 @@ const POLL_INTERVAL_MS = 200;
 const ESSENTIAL_ALSA_NAMES = new Set(["default", "pipewire"]);
 const HARDWARE_ALSA_RE = /^hw:CARD=[^,]+,DEV=0$/;
 
-function isEssential(d: OutputDeviceInfo): boolean {
+function isEssential(d: DeviceCommon): boolean {
   if (d.backend !== "Alsa") return true;
   if (ESSENTIAL_ALSA_NAMES.has(d.name)) return true;
   if (HARDWARE_ALSA_RE.test(d.name)) return true;
@@ -67,7 +80,7 @@ function isEssential(d: OutputDeviceInfo): boolean {
 /// enriches with `friendly_name` from /proc/asound/cards when
 /// available. We prefer the friendly name; otherwise fall back to
 /// extracting the card slug. Non-Alsa backends pass through untouched.
-function prettify(d: OutputDeviceInfo): string {
+function prettify(d: DeviceCommon): string {
   if (d.backend !== "Alsa") return d.name;
   if (d.name === "default") return "System default";
   if (d.name === "pipewire") return "PipeWire";
@@ -97,6 +110,15 @@ export default function App() {
   const [playBusy, setPlayBusy] = useState(false);
   const pollTimer = useRef<number | null>(null);
 
+  // Input-side device list — fetched separately because the user may
+  // want to record without listing outputs first. State mirror of the
+  // output-list state above.
+  const [inputs, setInputs] = useState<InputDeviceInfo[] | null>(null);
+  const [inputError, setInputError] = useState<string | null>(null);
+  const [inputLoading, setInputLoading] = useState(false);
+  const [showAllInputs, setShowAllInputs] = useState(false);
+  const [selectedInputDeviceId, setSelectedInputDeviceId] = useState<string | null>(null);
+
   async function handleListDevices() {
     setLoading(true);
     setError(null);
@@ -112,6 +134,22 @@ export default function App() {
       setDevices(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleListInputs() {
+    setInputLoading(true);
+    setInputError(null);
+    try {
+      const result = await invoke<InputDeviceInfo[]>("list_input_devices");
+      setInputs(result);
+      const def = result.find((d) => d.is_default_input);
+      if (def && !selectedInputDeviceId) setSelectedInputDeviceId(def.device_id);
+    } catch (e) {
+      setInputError(String(e));
+      setInputs(null);
+    } finally {
+      setInputLoading(false);
     }
   }
 
@@ -255,7 +293,14 @@ export default function App() {
     return showAll ? devices : devices.filter(isEssential);
   }, [devices, showAll]);
 
+  const visibleInputs = useMemo(() => {
+    if (!inputs) return null;
+    return showAllInputs ? inputs : inputs.filter(isEssential);
+  }, [inputs, showAllInputs]);
+
   const hiddenCount = devices && visible ? devices.length - visible.length : 0;
+  const hiddenInputCount =
+    inputs && visibleInputs ? inputs.length - visibleInputs.length : 0;
   const canPlay = !playBusy && !playInfo && !!selectedDeviceId && !!sourcePath.trim();
   const isPaused = playStatus?.state === "Paused";
   const isEnded = playStatus?.state === "Ended";
@@ -427,6 +472,85 @@ export default function App() {
           )}
         </section>
       )}
+
+      <section className="mt-12 border-t border-border pt-8">
+        <h2 className="text-lg font-semibold mb-3">Inputs</h2>
+        <button
+          type="button"
+          onClick={handleListInputs}
+          disabled={inputLoading}
+          className="rounded-md bg-accent px-4 py-2 text-base font-medium text-black hover:bg-accent-hover disabled:opacity-50 transition"
+        >
+          {inputLoading ? "Loading…" : "List Input Devices"}
+        </button>
+
+        {inputError && (
+          <pre className="mt-4 text-red-400 text-sm whitespace-pre-wrap">{inputError}</pre>
+        )}
+
+        {visibleInputs && visibleInputs.length === 0 && (
+          <p className="mt-6 text-muted">No input devices found.</p>
+        )}
+
+        {visibleInputs && visibleInputs.length > 0 && (
+          <>
+            <ul className="mt-6 space-y-2">
+              {visibleInputs.map((d) => {
+                const isSelected = d.device_id === selectedInputDeviceId;
+                return (
+                  <li key={d.device_id}>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedInputDeviceId(d.device_id)}
+                      className={`w-full text-left rounded-md border px-4 py-3 transition ${
+                        isSelected
+                          ? "bg-elevated border-accent"
+                          : "bg-elevated border-border hover:border-muted"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{prettify(d)}</span>
+                        {d.is_default_input && (
+                          <span className="rounded bg-accent/20 px-1.5 py-0.5 text-xs font-medium text-accent">
+                            DEFAULT
+                          </span>
+                        )}
+                        {isSelected && (
+                          <span className="ml-auto text-xs font-medium text-accent">
+                            SELECTED
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-sm text-muted mt-0.5 font-mono">
+                        {d.backend.toLowerCase()} · max {d.max_input_channels} ch · {d.name}
+                      </div>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+
+            {!showAllInputs && hiddenInputCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowAllInputs(true)}
+                className="mt-4 text-sm text-muted hover:text-fg underline-offset-2 hover:underline"
+              >
+                Show {hiddenInputCount} more (ALSA plug devices)
+              </button>
+            )}
+            {showAllInputs && (
+              <button
+                type="button"
+                onClick={() => setShowAllInputs(false)}
+                className="mt-4 text-sm text-muted hover:text-fg underline-offset-2 hover:underline"
+              >
+                Hide ALSA plug devices
+              </button>
+            )}
+          </>
+        )}
+      </section>
     </main>
   );
 }

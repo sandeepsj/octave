@@ -33,10 +33,11 @@ crossbeam-channel = "0.5"
 # Tauri brings tokio internally; we depend on it explicitly to
 # pull in `sync` (oneshot) without leaning on a re-export.
 tokio = { version = "1", features = ["sync"] }
-# Engine crate the UI exposes via tauri::commands. Path-dep
+# Engine crates the UI exposes via tauri::commands. Path-deps
 # (octave-app is intentionally NOT a workspace member — see root
 # Cargo.toml comment).
-octave-player = { path = "../../crates/octave-player" }
+octave-player   = { path = "../../crates/octave-player" }
+octave-recorder = { path = "../../crates/octave-recorder" }
 
 # Mirror the workspace's clippy gates so the app's Rust side is
 # held to the same bar as the engine crates.

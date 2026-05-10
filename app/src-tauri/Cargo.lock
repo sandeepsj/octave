@@ -2273,6 +2273,7 @@ version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
  "octave-player",
+ "octave-recorder",
  "serde",
  "serde_json",
  "tauri",
@@ -2287,6 +2288,20 @@ name = "octave-player"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "cpal",
+ "rtrb",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "octave-recorder"
+version = "0.1.0"
+dependencies = [
+ "assert_no_alloc",
+ "bytemuck",
  "cpal",
  "rtrb",
  "serde",

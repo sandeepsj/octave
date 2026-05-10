@@ -1,13 +1,14 @@
-//! Tauri shell — wires `octave_player` into the React UI via
-//! `#[tauri::command]` handlers.
+//! Tauri shell — wires `octave_player` and `octave_recorder` into the
+//! React UI via `#[tauri::command]` handlers.
 //!
 //! Engine surface mirrored to the UI (and, separately, to the agent
 //! via `octave-mcp`):
 //!
-//! - `list_output_devices` — enumerate output devices.
-//! - `playback_start` / `playback_stop` — open a WAV file and play it
-//!   through a chosen device; stop it. Backed by [`app_actor`] because
-//!   `cpal::Stream` is `!Send` and `tauri::State` requires `Send + Sync`.
+//! - `list_output_devices` / `list_input_devices` — enumerate devices.
+//! - `playback_start` / `playback_pause` / `playback_resume` /
+//!   `playback_stop` / `playback_status` — file → device playback +
+//!   transport. Backed by [`app_actor`] because `cpal::Stream` is
+//!   `!Send` and `tauri::State` requires `Send + Sync`.
 
 mod app_actor;
 
@@ -45,7 +46,7 @@ struct OutputDeviceInfo {
 fn list_output_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<OutputDeviceInfo> {
     let alsa_long_names = read_alsa_card_long_names();
     actor
-        .catalog()
+        .playback_catalog()
         .list_output_devices()
         .into_iter()
         .map(|d| OutputDeviceInfo {
@@ -58,6 +59,40 @@ fn list_output_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<OutputDev
             backend: format!("{:?}", d.backend),
             is_default_output: d.is_default_output,
             max_output_channels: d.max_output_channels,
+        })
+        .collect()
+}
+
+/// Symmetric to `OutputDeviceInfo` for the recorder side. The
+/// recorder's `Backend` variant set is wider — it has `Other(String)`
+/// for unknown hosts (the player's doesn't yet) — but the wire shape
+/// is the same: stringified backend, friendly name resolved on Linux.
+///
+/// Keep this in sync with `InputDeviceInfo` in `app/src/App.tsx`.
+#[derive(Serialize)]
+struct InputDeviceInfo {
+    device_id: String,
+    name: String,
+    friendly_name: Option<String>,
+    backend: String,
+    is_default_input: bool,
+    max_input_channels: u16,
+}
+
+#[tauri::command]
+fn list_input_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<InputDeviceInfo> {
+    let alsa_long_names = read_alsa_card_long_names();
+    actor
+        .recorder_catalog()
+        .list_devices()
+        .into_iter()
+        .map(|d| InputDeviceInfo {
+            friendly_name: alsa_friendly_name(&d.name, &alsa_long_names),
+            device_id: d.id.0,
+            name: d.name,
+            backend: format!("{:?}", d.backend),
+            is_default_input: d.is_default_input,
+            max_input_channels: d.max_input_channels,
         })
         .collect()
 }
@@ -260,6 +295,7 @@ pub fn run() {
         .manage(actor)
         .invoke_handler(tauri::generate_handler![
             list_output_devices,
+            list_input_devices,
             playback_start,
             playback_pause,
             playback_resume,
