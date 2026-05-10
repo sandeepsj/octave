@@ -215,74 +215,75 @@ pub struct PlaybackHandle {
     inner: Internals,
 }
 
-impl DeviceCatalog {
-    /// Open the output device, load the source, build and start the
-    /// cpal output stream, spawn the reader thread. On success the
-    /// returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
-    ///
-    /// Uses the cached `cpal::Device` for `spec.device_id` when
-    /// present (i.e. when this catalog has called
-    /// [`Self::list_output_devices`] since startup) — see plan §3.3.1
-    /// for why that matters on Linux. Cache miss falls through to
-    /// fresh enumeration.
-    ///
-    /// Plan §3.7 / §13.3 single-session enforcement: a process-global
-    /// slot is claimed at the top of this call and released by
-    /// [`PlaybackHandle::close`] (or its `Drop`). A second concurrent
-    /// caller gets [`StartError::AlreadyPlaying { current_session }`].
-    pub fn start(&self, spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
-        // Claim the slot before spending any I/O / cpal cycles. Released
-        // below on every error path and by close()/Drop on success.
-        let session_id = acquire_session()?;
+/// Open the output device, load the source, build and start the
+/// cpal output stream, spawn the reader thread. On success the
+/// returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
+///
+/// Uses the cached `cpal::Device` for `spec.device_id` when present
+/// in `catalog` (i.e. when the catalog's `list_output_devices` has
+/// run since startup) — see plan §3.3.1 for why that matters on
+/// Linux. Cache miss falls through to fresh enumeration.
+///
+/// Plan §3.7 / §13.3 single-session enforcement: a process-global
+/// slot is claimed at the top of this call and released by
+/// [`PlaybackHandle::close`] (or its `Drop`). A second concurrent
+/// caller gets [`StartError::AlreadyPlaying { current_session }`].
+///
+/// `start` is a free function (not a method on `DeviceCatalog`)
+/// because the catalog itself lives in the `octave-audio-devices`
+/// crate; Rust's orphan rule prevents an `impl` block here.
+pub fn start(catalog: &DeviceCatalog, spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
+    // Claim the slot before spending any I/O / cpal cycles. Released
+    // below on every error path and by close()/Drop on success.
+    let session_id = acquire_session()?;
 
-        // From here on, any early return must release the slot.
-        let result = (|| -> Result<PlaybackHandle, StartError> {
-            let device = self.find_device(&spec.device_id)?;
-            let ConstructedSource {
-                source,
+    // From here on, any early return must release the slot.
+    let result = (|| -> Result<PlaybackHandle, StartError> {
+        let device = catalog.find_device(&spec.device_id)?;
+        let ConstructedSource {
+            source,
+            sample_rate: source_rate,
+            channels: source_channels,
+            duration_frames,
+        } = construct_source(&spec.source)?;
+
+        validate_source_against_device(catalog, &spec.device_id, source_rate, source_channels)?;
+
+        let telemetry = Arc::new(Telemetry::new(source_channels));
+        let signals = Arc::new(TransportSignals::new());
+
+        let (stream, reader_join) = build_running_pipeline(
+            &device,
+            source,
+            source_rate,
+            source_channels,
+            spec.buffer_size,
+            Arc::clone(&telemetry),
+            Arc::clone(&signals),
+        )?;
+
+        Ok(PlaybackHandle {
+            inner: Internals {
+                state: PlaybackState::Playing,
+                session_id,
                 sample_rate: source_rate,
                 channels: source_channels,
                 duration_frames,
-            } = construct_source(&spec.source)?;
+                telemetry,
+                signals,
+                stream: Some(stream),
+                reader_join: Some(reader_join),
+                spec,
+                device: Some(device),
+                paused_via_drop: false,
+            },
+        })
+    })();
 
-            validate_source_against_device(self, &spec.device_id, source_rate, source_channels)?;
-
-            let telemetry = Arc::new(Telemetry::new(source_channels));
-            let signals = Arc::new(TransportSignals::new());
-
-            let (stream, reader_join) = build_running_pipeline(
-                &device,
-                source,
-                source_rate,
-                source_channels,
-                spec.buffer_size,
-                Arc::clone(&telemetry),
-                Arc::clone(&signals),
-            )?;
-
-            Ok(PlaybackHandle {
-                inner: Internals {
-                    state: PlaybackState::Playing,
-                    session_id,
-                    sample_rate: source_rate,
-                    channels: source_channels,
-                    duration_frames,
-                    telemetry,
-                    signals,
-                    stream: Some(stream),
-                    reader_join: Some(reader_join),
-                    spec,
-                    device: Some(device),
-                    paused_via_drop: false,
-                },
-            })
-        })();
-
-        if result.is_err() {
-            release_session(session_id);
-        }
-        result
+    if result.is_err() {
+        release_session(session_id);
     }
+    result
 }
 
 /// Constructed-source bundle returned by [`construct_source`].
@@ -339,7 +340,7 @@ fn validate_source_against_device(
     source_rate: u32,
     source_channels: u16,
 ) -> Result<(), StartError> {
-    let caps = catalog.output_device_capabilities(device_id)?;
+    let caps = catalog.output_capabilities(device_id)?;
     if !caps.supported_sample_rates.contains(&source_rate) {
         return Err(StartError::RateUnsupportedByDevice {
             requested: source_rate,

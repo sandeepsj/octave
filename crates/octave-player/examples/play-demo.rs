@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         .unwrap_or(&devices[0]);
     println!("\nopening default: {}", default.name);
 
-    let caps = match catalog.output_device_capabilities(&default.id) {
+    let caps = match catalog.output_capabilities(&default.id) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("output_device_capabilities failed: {e}");
@@ -70,7 +70,7 @@ fn main() -> ExitCode {
         buffer_size: BufferSize::Default,
     };
 
-    let mut handle = match catalog.start(spec) {
+    let mut handle = match octave_player::start(&catalog, spec) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("start failed: {e}");

@@ -21,11 +21,15 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use octave_recorder::{
-    ArmError, BufferSize, CancelError, DeviceCatalog as RecorderCatalog, DeviceId, OpenError,
-    RecordError, RecordingHandle, RecordingSpec, StopError,
+    ArmError, BufferSize, CancelError, DeviceId, OpenError, RecordError, RecordingHandle,
+    RecordingSpec, StopError,
 };
 
-use octave_player::{DeviceCatalog as PlayerCatalog, PlaybackHandle, PlaybackSpec};
+// Single shared device catalog — playback and recording route through
+// the same cache so the player's cached `cpal::Device` doesn't block
+// the recorder's input probe (and vice versa). See plan §3.3.1.
+use octave_audio_devices::DeviceCatalog;
+use octave_player::{PlaybackHandle, PlaybackSpec};
 
 use crate::types::{
     LevelsResult, PlaybackSeekResult, PlaybackStatusJson, PlaybackTransportResult,
@@ -53,36 +57,27 @@ pub struct AudioActorHandle {
     /// drops see `None` and skip. The `Mutex` is uncontended on the
     /// happy path — only `Drop` ever touches it.
     join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
-    /// Output-device catalog shared between read-only handler tools
-    /// (`playback_list_output_devices`, `playback_describe_device`)
-    /// and the actor thread that calls `playback.start(...)`. One Arc
-    /// per actor instance — the cache it owns survives across all
-    /// list / describe / start calls so `start` can reuse the
-    /// `cpal::Device` from the most recent listing instead of
-    /// re-enumerating (plan §3.3.1).
-    playback: Arc<PlayerCatalog>,
-    /// Symmetric input-device catalog for the recorder side. Same
-    /// rationale as `playback` — `recording_list_devices` and
-    /// `recording_start` share this Arc so the cache survives across
-    /// list + open. See `record-audio` §3.3.1.
-    recorder: Arc<RecorderCatalog>,
+    /// Single shared device catalog — both handler tools (read-only
+    /// list/describe) and the actor thread (start_recording /
+    /// start_playback) route through this Arc. One catalog per actor
+    /// instance; the cache survives across all calls so `start`/`open`
+    /// can reuse the `cpal::Device` from the most recent listing
+    /// instead of re-enumerating (plan §3.3.1).
+    catalog: Arc<DeviceCatalog>,
 }
 
 impl AudioActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
-        let playback = Arc::new(PlayerCatalog::new());
-        let recorder = Arc::new(RecorderCatalog::new());
-        let actor_playback = Arc::clone(&playback);
-        let actor_recorder = Arc::clone(&recorder);
+        let catalog = Arc::new(DeviceCatalog::new());
+        let actor_catalog = Arc::clone(&catalog);
         let join = thread::Builder::new()
             .name("octave-mcp-audio".into())
-            .spawn(move || run_actor(rx, actor_playback, actor_recorder))?;
+            .spawn(move || run_actor(rx, actor_catalog))?;
         Ok(Self {
             tx: Some(tx),
             join: Arc::new(std::sync::Mutex::new(Some(join))),
-            playback,
-            recorder,
+            catalog,
         })
     }
 
@@ -97,15 +92,11 @@ impl AudioActorHandle {
         }
     }
 
-    /// Borrow the actor's playback (output) catalog for read-only
-    /// tools. `Send + Sync`, safe to share across concurrent tool calls.
-    pub fn playback_catalog(&self) -> &Arc<PlayerCatalog> {
-        &self.playback
-    }
-
-    /// Borrow the actor's recorder (input) catalog for read-only tools.
-    pub fn recorder_catalog(&self) -> &Arc<RecorderCatalog> {
-        &self.recorder
+    /// Borrow the actor's shared device catalog for read-only tools
+    /// (list / describe). `Send + Sync`, safe to share across
+    /// concurrent tool calls.
+    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
+        &self.catalog
     }
 }
 
@@ -274,14 +265,10 @@ struct ActorState {
     playback: Option<PlaybackSession>,
 }
 
-fn run_actor(
-    rx: Receiver<Command>,
-    playback: Arc<PlayerCatalog>,
-    recorder: Arc<RecorderCatalog>,
-) {
+fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
     let mut state = ActorState::default();
     while let Ok(cmd) = rx.recv() {
-        handle_command(cmd, &mut state, &playback, &recorder);
+        handle_command(cmd, &mut state, &catalog);
     }
     // Channel closed → drain and close everything.
     for (_, mut s) in state.recording.drain() {
@@ -294,19 +281,14 @@ fn run_actor(
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn handle_command(
-    cmd: Command,
-    state: &mut ActorState,
-    playback: &PlayerCatalog,
-    recorder: &RecorderCatalog,
-) {
+fn handle_command(cmd: Command, state: &mut ActorState, catalog: &DeviceCatalog) {
     match cmd {
         Command::StartRecording {
             spec,
             output_path,
             reply,
         } => {
-            let _ = reply.send(start_session(spec, &output_path, &mut state.recording, recorder));
+            let _ = reply.send(start_session(spec, &output_path, &mut state.recording, catalog));
         }
         Command::Stop { session_id, reply } => {
             let result = match state.recording.remove(&session_id) {
@@ -387,7 +369,7 @@ fn handle_command(
         //   Playback handlers
         // ============================================================
         Command::PlaybackStart { spec, reply } => {
-            let result = start_playback(spec, &mut state.playback, playback);
+            let result = start_playback(spec, &mut state.playback, catalog);
             let _ = reply.send(result);
         }
         Command::PlaybackPause { session_id, reply } => {
@@ -503,15 +485,14 @@ fn playback_transport(ps: &PlaybackSession) -> PlaybackTransportResult {
 fn start_playback(
     spec: PlaybackSpec,
     playback: &mut Option<PlaybackSession>,
-    catalog: &PlayerCatalog,
+    catalog: &DeviceCatalog,
 ) -> Result<PlaybackStartReply, PlaybackStartError> {
     if let Some(ps) = playback.as_ref() {
         return Err(PlaybackStartError::AlreadyPlaying {
             current_session: ps.session_id,
         });
     }
-    let handle = catalog
-        .start(spec)
+    let handle = octave_player::start(catalog, spec)
         .map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
     let session_id = Uuid::new_v4();
     let started_at = SystemTime::now();
@@ -534,13 +515,13 @@ fn start_session(
     spec: RecordingSpec,
     output_path: &std::path::Path,
     sessions: &mut HashMap<Uuid, Session>,
-    catalog: &RecorderCatalog,
+    catalog: &DeviceCatalog,
 ) -> Result<StartReply, StartReplyError> {
     if sessions.len() >= MAX_SESSIONS {
         return Err(StartReplyError::TooManySessions);
     }
-    let mut handle =
-        catalog.open(spec.clone()).map_err(|e| StartReplyError::Open(open_err_str(&e)))?;
+    let mut handle = octave_recorder::open(catalog, spec.clone())
+        .map_err(|e| StartReplyError::Open(open_err_str(&e)))?;
     if let Err(e) = handle.arm() {
         handle.close();
         return Err(StartReplyError::Arm(arm_err_str(&e)));

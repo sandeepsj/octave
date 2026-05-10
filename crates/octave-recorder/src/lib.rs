@@ -40,65 +40,21 @@ mod writer;
 #[cfg(test)]
 mod test_support;
 
+pub use audio::open;
 pub use device::DeviceCatalog;
 pub use error::{ArmError, CancelError, OpenError, RecordError, StopError};
 pub use state::RecorderState;
 
-/// Platform-stable identifier for an audio device.
-///
-/// Encoded as `"{HOST_NAME}:{DEVICE_NAME}"` — opaque to callers, but
-/// stable enough that re-finding a device by id works as long as the
-/// device's name doesn't change between runs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DeviceId(pub String);
-
-/// The kernel-level audio backend a device is exposed through.
-///
-/// `PipeWire` is **reserved** for future direct-PipeWire integrations;
-/// today PipeWire on Linux is reached via the `Alsa` host (cpal exposes
-/// it as ALSA), so `host_id_to_backend` never produces this variant.
-///
-/// `Other(name)` is returned for any cpal `HostId::name()` value not
-/// in the explicit list — better than silently coercing to `Alsa`,
-/// which used to mis-tag macOS / Windows / future hosts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Backend {
-    Alsa,
-    PipeWire,
-    Jack,
-    CoreAudio,
-    Wasapi,
-    Asio,
-    Other(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub id: DeviceId,
-    pub name: String,
-    pub backend: Backend,
-    pub is_default_input: bool,
-    pub is_class_compliant_usb: bool,
-    pub max_input_channels: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Capabilities {
-    pub min_sample_rate: u32,
-    pub max_sample_rate: u32,
-    pub supported_sample_rates: Vec<u32>,
-    pub min_buffer_size: u32,
-    pub max_buffer_size: u32,
-    pub channels: Vec<u16>,
-    pub default_sample_rate: u32,
-    pub default_buffer_size: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BufferSize {
-    Default,
-    Fixed(u32),
-}
+// Cross-engine types live in the shared `octave-audio-devices` crate
+// so the recorder and the player share one cache (see plan §3.3.1).
+// Re-export the names callers used to import directly so existing
+// `octave_recorder::DeviceId` paths keep working. `DeviceInfo` /
+// `Capabilities` are recorder-flavoured aliases of the shared
+// `InputDeviceInfo` / `InputCapabilities` types.
+pub use octave_audio_devices::{
+    Backend, BufferSize, DeviceId, InputCapabilities as Capabilities,
+    InputDeviceInfo as DeviceInfo,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingSpec {

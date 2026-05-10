@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/octave-audio-devices",
     "crates/octave-mcp",
     "crates/octave-player",
     "crates/octave-recorder",
@@ -40,8 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # transport-io for the stdio adapter, schemars for typed-arg schema derivation.
 rmcp            = { version = "1.5", features = ["server", "macros", "transport-io", "schemars"] }
 # in-tree workspace crates
-octave-player   = { path = "crates/octave-player" }
-octave-recorder = { path = "crates/octave-recorder" }
+octave-audio-devices = { path = "crates/octave-audio-devices" }
+octave-player        = { path = "crates/octave-player" }
+octave-recorder      = { path = "crates/octave-recorder" }
 # dev-deps shared across crates
 hound           = "3"
 tempfile        = "3"

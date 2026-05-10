@@ -232,24 +232,18 @@ fn is_metering_state(state: RecorderState) -> bool {
     )
 }
 
-impl DeviceCatalog {
-    /// Open a device, build the cpal stream (parked), and return an
-    /// [`Idle`](RecorderState::Idle) handle ready to be `arm`ed. Uses
-    /// the cached `cpal::Device` for `spec.device_id` when present
-    /// (i.e. when this catalog has called [`Self::list_devices`] since
-    /// startup) — see plan §3.3.1. Cache miss falls through to fresh
-    /// enumeration.
-    pub fn open(&self, spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
-        open_inner(self, spec)
-    }
-}
-
-/// Body of [`DeviceCatalog::open`]; lives outside the `impl` block so
-/// the existing `?` cascade keeps its compact `(spec, caps)` ownership
-/// shape without nesting it inside an `impl … { fn …` indent.
-fn open_inner(catalog: &DeviceCatalog, spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
+/// Open a device, build the cpal stream (parked), and return an
+/// [`Idle`](RecorderState::Idle) handle ready to be `arm`ed. Uses the
+/// cached `cpal::Device` for `spec.device_id` when present in
+/// `catalog` — see plan §3.3.1. Cache miss falls through to fresh
+/// enumeration.
+///
+/// `open` is a free function (not a method on `DeviceCatalog`)
+/// because the catalog itself lives in the `octave-audio-devices`
+/// crate; Rust's orphan rule prevents an `impl` block here.
+pub fn open(catalog: &DeviceCatalog, spec: RecordingSpec) -> Result<RecordingHandle, OpenError> {
     let device = catalog.find_device(&spec.device_id)?;
-    let caps = catalog.device_capabilities(&spec.device_id)?;
+    let caps = catalog.input_capabilities(&spec.device_id)?;
 
     if !caps.channels.contains(&spec.channels)
         || spec.sample_rate < caps.min_sample_rate

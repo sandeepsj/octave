@@ -2272,6 +2272,7 @@ name = "octave-app"
 version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
+ "octave-audio-devices",
  "octave-player",
  "octave-recorder",
  "serde",
@@ -2284,11 +2285,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "octave-audio-devices"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "octave-player"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "cpal",
+ "octave-audio-devices",
  "rtrb",
  "serde",
  "thiserror 2.0.18",
@@ -2303,6 +2315,7 @@ dependencies = [
  "assert_no_alloc",
  "bytemuck",
  "cpal",
+ "octave-audio-devices",
  "rtrb",
  "serde",
  "thiserror 2.0.18",

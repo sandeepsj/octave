@@ -38,7 +38,7 @@ mod types;
 mod wav;
 
 pub use audio::{
-    PlaybackHandle, SeekError as PlaybackSeekError, StartError, StopError, TransportError,
+    PlaybackHandle, SeekError as PlaybackSeekError, StartError, StopError, TransportError, start,
 };
 pub use device::{DeviceCatalog, DeviceError};
 pub use file_source::{FileSource, OpenFileError};

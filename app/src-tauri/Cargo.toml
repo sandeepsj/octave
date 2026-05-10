@@ -36,8 +36,9 @@ tokio = { version = "1", features = ["sync"] }
 # Engine crates the UI exposes via tauri::commands. Path-deps
 # (octave-app is intentionally NOT a workspace member — see root
 # Cargo.toml comment).
-octave-player   = { path = "../../crates/octave-player" }
-octave-recorder = { path = "../../crates/octave-recorder" }
+octave-audio-devices = { path = "../../crates/octave-audio-devices" }
+octave-player        = { path = "../../crates/octave-player" }
+octave-recorder      = { path = "../../crates/octave-recorder" }
 
 # Mirror the workspace's clippy gates so the app's Rust side is
 # held to the same bar as the engine crates.

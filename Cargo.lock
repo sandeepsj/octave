@@ -813,10 +813,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octave-audio-devices"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "octave-mcp"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "octave-audio-devices",
  "octave-player",
  "octave-recorder",
  "rmcp",
@@ -837,6 +848,7 @@ dependencies = [
  "assert_no_alloc",
  "cpal",
  "hound",
+ "octave-audio-devices",
  "rtrb",
  "serde",
  "tempfile",
@@ -853,6 +865,7 @@ dependencies = [
  "bytemuck",
  "cpal",
  "hound",
+ "octave-audio-devices",
  "rtrb",
  "serde",
  "tempfile",

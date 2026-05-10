@@ -46,7 +46,7 @@ struct OutputDeviceInfo {
 fn list_output_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<OutputDeviceInfo> {
     let alsa_long_names = read_alsa_card_long_names();
     actor
-        .playback_catalog()
+        .catalog()
         .list_output_devices()
         .into_iter()
         .map(|d| OutputDeviceInfo {
@@ -63,10 +63,11 @@ fn list_output_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<OutputDev
         .collect()
 }
 
-/// Symmetric to `OutputDeviceInfo` for the recorder side. The
-/// recorder's `Backend` variant set is wider — it has `Other(String)`
-/// for unknown hosts (the player's doesn't yet) — but the wire shape
-/// is the same: stringified backend, friendly name resolved on Linux.
+/// Symmetric to `OutputDeviceInfo` for the recorder side. Both
+/// engines re-export the same `Backend` enum from
+/// `octave-audio-devices`, so the wire shape (stringified backend,
+/// friendly name resolved on Linux) is identical across input and
+/// output `list_*_devices` responses.
 ///
 /// Keep this in sync with `InputDeviceInfo` in `app/src/App.tsx`.
 #[derive(Serialize)]
@@ -83,8 +84,8 @@ struct InputDeviceInfo {
 fn list_input_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<InputDeviceInfo> {
     let alsa_long_names = read_alsa_card_long_names();
     actor
-        .recorder_catalog()
-        .list_devices()
+        .catalog()
+        .list_input_devices()
         .into_iter()
         .map(|d| InputDeviceInfo {
             friendly_name: alsa_friendly_name(&d.name, &alsa_long_names),
@@ -369,9 +370,9 @@ async fn recording_start(
     // reports.
     let id = DeviceId(device_id);
     let caps = actor
-        .recorder_catalog()
-        .device_capabilities(&id)
-        .map_err(|e| format!("device_capabilities: {e}"))?;
+        .catalog()
+        .input_capabilities(&id)
+        .map_err(|e| format!("input_capabilities: {e}"))?;
     let sample_rate = if caps.supported_sample_rates.contains(&48_000) {
         48_000
     } else {

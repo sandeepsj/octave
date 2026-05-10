@@ -33,7 +33,7 @@ fn main() -> ExitCode {
     // §3.3.1) so the demo doesn't lose to PipeWire's ALSA exclusive-
     // grab race.
     let catalog = DeviceCatalog::new();
-    let devices = catalog.list_devices();
+    let devices = catalog.list_input_devices();
     if devices.is_empty() {
         eprintln!("no input devices found");
         return ExitCode::from(2);
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         .unwrap_or(&devices[0]);
     println!("\nopening default: {}", default.name);
 
-    let caps = match catalog.device_capabilities(&default.id) {
+    let caps = match catalog.input_capabilities(&default.id) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("device_capabilities failed: {e}");
@@ -79,7 +79,7 @@ fn main() -> ExitCode {
     };
     println!("  using: {sample_rate} Hz, {channels} ch, default buffer\n");
 
-    let mut handle = match catalog.open(spec) {
+    let mut handle = match octave_recorder::open(&catalog, spec) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("open failed: {e}");

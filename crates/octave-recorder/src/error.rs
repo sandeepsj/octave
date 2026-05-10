@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use octave_audio_devices::DeviceError;
 use thiserror::Error;
 
 use crate::{Capabilities, DeviceId, RecorderState, RecordingSpec};
@@ -23,6 +24,15 @@ pub enum OpenError {
 
     #[error("permission denied")]
     PermissionDenied,
+}
+
+impl From<DeviceError> for OpenError {
+    fn from(e: DeviceError) -> Self {
+        match e {
+            DeviceError::DeviceNotFound { id } => OpenError::DeviceNotFound { id },
+            DeviceError::BackendError(s) => OpenError::BackendError(s),
+        }
+    }
 }
 
 /// Failures from [`crate::RecordingHandle::arm`].

@@ -137,14 +137,9 @@ impl From<BufferSizeJson> for BufferSize {
     }
 }
 
-impl From<BufferSizeJson> for octave_player::BufferSize {
-    fn from(b: BufferSizeJson) -> Self {
-        match b {
-            BufferSizeJson::Default => octave_player::BufferSize::Default,
-            BufferSizeJson::Fixed { samples } => octave_player::BufferSize::Fixed(samples),
-        }
-    }
-}
+// `octave_player::BufferSize` is now an alias of the same shared type
+// `octave_recorder::BufferSize` re-exports, so a separate impl would
+// conflict with the one above. Both engines use the same enum.
 
 /// Argument to `recording_start`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -273,21 +268,16 @@ impl From<octave_player::OutputDeviceInfo> for OutputDeviceInfoJson {
         Self {
             device_id: d.id.0,
             name: d.name,
-            backend: player_backend(d.backend),
+            // `octave_player::Backend` and `octave_recorder::Backend`
+            // are now the same enum (re-exported from
+            // `octave-audio-devices`), so the existing
+            // `From<Backend> for BackendJson` impl above handles both
+            // facades symmetrically — no separate player_backend()
+            // helper needed.
+            backend: d.backend.into(),
             is_default_output: d.is_default_output,
             max_output_channels: d.max_output_channels,
         }
-    }
-}
-
-fn player_backend(b: octave_player::Backend) -> BackendJson {
-    match b {
-        octave_player::Backend::Alsa => BackendJson::Alsa,
-        octave_player::Backend::PipeWire => BackendJson::PipeWire,
-        octave_player::Backend::Jack => BackendJson::Jack,
-        octave_player::Backend::CoreAudio => BackendJson::CoreAudio,
-        octave_player::Backend::Wasapi => BackendJson::Wasapi,
-        octave_player::Backend::Asio => BackendJson::Asio,
     }
 }
 

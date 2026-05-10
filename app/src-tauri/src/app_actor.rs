@@ -22,12 +22,15 @@ use tokio::sync::oneshot;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use octave_player::{
-    DeviceCatalog as PlayerCatalog, PlaybackHandle, PlaybackSpec, PlaybackStatus,
-};
-use octave_recorder::{
-    DeviceCatalog as RecorderCatalog, RecordedClip, RecordingHandle, RecordingSpec,
-};
+// One shared catalog for both directions — see plan §3.3.1. Before
+// the unification the player and recorder each owned a private
+// `DeviceCatalog`, and the player's cached `cpal::Device` for a
+// shared device blocked the recorder's input probe (and vice versa)
+// because cpal's `DeviceHandles::open` opens both PCMs during
+// enumeration.
+use octave_audio_devices::DeviceCatalog;
+use octave_player::{PlaybackHandle, PlaybackSpec, PlaybackStatus};
+use octave_recorder::{RecordedClip, RecordingHandle, RecordingSpec};
 
 /// Bounded so a runaway producer can't grow the queue without limit.
 /// 16 is plenty: the UI sends one command per click, the actor
@@ -43,37 +46,26 @@ pub struct AppActorHandle {
     /// and `handle.join()` would deadlock.
     tx: Option<Sender<Command>>,
     join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
-    /// Output-device catalog shared between the synchronous
-    /// `list_output_devices` Tauri command and the actor thread that
-    /// calls `playback.start(...)`. Holding the same catalog across
-    /// list and start is what defeats the PipeWire ALSA enumerate-race
-    /// (plan §3.3.1) — `start` reuses the cpal::Device the listing
-    /// already opened.
-    playback: Arc<PlayerCatalog>,
-    /// Symmetric input-device catalog for the recorder side. Same
-    /// rationale as `playback`. Currently only feeds the read-only
-    /// `list_input_devices` Tauri command — the actor doesn't yet
-    /// own a recording session (record affordance is the next cycle
-    /// step), but the catalog lives here so the future `record_*`
-    /// commands and the listing share the same cached handles.
-    recorder: Arc<RecorderCatalog>,
+    /// Single shared device catalog. Read-only Tauri commands
+    /// (`list_output_devices`, `list_input_devices`) and the actor
+    /// thread (`playback_start`, `recording_start`) all route through
+    /// this Arc — same cache, no two `cpal::Device` wrappers fighting
+    /// over the same physical device's PCMs.
+    catalog: Arc<DeviceCatalog>,
 }
 
 impl AppActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
-        let playback = Arc::new(PlayerCatalog::new());
-        let recorder = Arc::new(RecorderCatalog::new());
-        let actor_playback = Arc::clone(&playback);
-        let actor_recorder = Arc::clone(&recorder);
+        let catalog = Arc::new(DeviceCatalog::new());
+        let actor_catalog = Arc::clone(&catalog);
         let join = thread::Builder::new()
             .name("octave-app-audio".into())
-            .spawn(move || run_actor(rx, actor_playback, actor_recorder))?;
+            .spawn(move || run_actor(rx, actor_catalog))?;
         Ok(Self {
             tx: Some(tx),
             join: Arc::new(std::sync::Mutex::new(Some(join))),
-            playback,
-            recorder,
+            catalog,
         })
     }
 
@@ -86,17 +78,11 @@ impl AppActorHandle {
         }
     }
 
-    /// Borrow the actor's playback (output) catalog for the read-only
-    /// `list_output_devices` Tauri command. `Send + Sync`, safe to
-    /// share across concurrent commands.
-    pub fn playback_catalog(&self) -> &Arc<PlayerCatalog> {
-        &self.playback
-    }
-
-    /// Borrow the actor's recorder (input) catalog for the read-only
-    /// `list_input_devices` Tauri command.
-    pub fn recorder_catalog(&self) -> &Arc<RecorderCatalog> {
-        &self.recorder
+    /// Borrow the actor's shared device catalog for the read-only
+    /// `list_output_devices` / `list_input_devices` Tauri commands.
+    /// `Send + Sync`, safe to share across concurrent commands.
+    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
+        &self.catalog
     }
 }
 
@@ -241,11 +227,7 @@ struct RecordingSession {
     started_at: Instant,
 }
 
-fn run_actor(
-    rx: Receiver<Command>,
-    catalog: Arc<PlayerCatalog>,
-    recorder: Arc<RecorderCatalog>,
-) {
+fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
     let mut active: Option<PlaybackHandle> = None;
     let mut recording: Option<RecordingSession> = None;
     while let Ok(cmd) = rx.recv() {
@@ -255,7 +237,7 @@ fn run_actor(
                     let _ = reply.send(Err(PlaybackStartError::AlreadyPlaying));
                     continue;
                 }
-                match catalog.start(spec) {
+                match octave_player::start(&catalog, spec) {
                     Ok(handle) => {
                         let status = handle.status();
                         active = Some(handle);
@@ -327,7 +309,7 @@ fn run_actor(
                     let _ = reply.send(Err(RecordingStartError::AlreadyRecording));
                     continue;
                 }
-                let result = start_recording(spec, output_path, &recorder);
+                let result = start_recording(spec, output_path, &catalog);
                 match result {
                     Ok((session, sample_rate, channels)) => {
                         let path = session.output_path.clone();
@@ -392,12 +374,11 @@ fn run_actor(
 fn start_recording(
     spec: RecordingSpec,
     output_path: PathBuf,
-    catalog: &RecorderCatalog,
+    catalog: &DeviceCatalog,
 ) -> Result<(RecordingSession, u32, u16), RecordingStartError> {
     let sample_rate = spec.sample_rate;
     let channels = spec.channels;
-    let mut handle = catalog
-        .open(spec)
+    let mut handle = octave_recorder::open(catalog, spec)
         .map_err(|e| RecordingStartError::Open(format!("{e}")))?;
     if let Err(e) = handle.arm() {
         handle.close();

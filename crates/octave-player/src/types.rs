@@ -1,58 +1,19 @@
-//! Public typed surface — the shapes the API and MCP layer hand back.
+//! Public typed surface — the playback-engine-specific shapes.
 //!
-//! Several types here intentionally duplicate `octave-recorder`'s
-//! equivalents (`Backend`, `DeviceId`, `BufferSize`). When a third
-//! consumer (mix-engine, editor) needs the same types we'll extract
-//! a shared `octave-audio-types` crate; until then duplication beats
-//! the cross-crate dependency.
+//! Cross-engine types (`DeviceId`, `Backend`, `BufferSize`,
+//! `OutputDeviceInfo`, `OutputCapabilities`) live in the shared
+//! `octave-audio-devices` crate and are re-exported here for caller
+//! ergonomics — `octave_player::DeviceId` keeps working without
+//! callers needing to learn a third crate name.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// Platform-stable identifier for an audio device. Encoded as
-/// `"{HOST_NAME}:{DEVICE_NAME}"`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DeviceId(pub String);
-
-/// The kernel-level audio backend a device is exposed through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Backend {
-    Alsa,
-    PipeWire,
-    Jack,
-    CoreAudio,
-    Wasapi,
-    Asio,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputDeviceInfo {
-    pub id: DeviceId,
-    pub name: String,
-    pub backend: Backend,
-    pub is_default_output: bool,
-    pub max_output_channels: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputCapabilities {
-    pub min_sample_rate: u32,
-    pub max_sample_rate: u32,
-    pub supported_sample_rates: Vec<u32>,
-    pub min_buffer_size: u32,
-    pub max_buffer_size: u32,
-    pub channels: Vec<u16>,
-    pub default_sample_rate: u32,
-    pub default_buffer_size: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BufferSize {
-    Default,
-    Fixed(u32),
-}
+pub use octave_audio_devices::{
+    Backend, BufferSize, DeviceId, OutputCapabilities, OutputDeviceInfo,
+};
 
 /// Source the playback engine should pull from.
 #[derive(Debug, Clone)]
