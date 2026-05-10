@@ -131,6 +131,21 @@ Identical kernel stack to [`record-audio` §3.2](./record-audio.md#32-driver--ke
 
 Same crate as recording[^cpal]; we use the output APIs (`Device::default_output_device()`, `Device::supported_output_configs()`, `Device::build_output_stream(...)`). Stream config (sample-rate, buffer-size, channels, sample-format) mirrors recording. Sample format is **always** `cpal::SampleFormat::F32`.
 
+#### 3.3.1 Device-handle caching — `DeviceCatalog`
+
+> [!IMPORTANT]
+> Linux-specific defect this defends against: `cpal`'s ALSA backend enumerates devices by calling `snd_pcm_open(name, …, SND_PCM_NONBLOCK)` on every PCM hint and **silently drops** any device whose open returns `EBUSY`. PipeWire (and PulseAudio) routinely hold physical `hw:CARD=X,DEV=Y` PCMs exclusively while the user has a desktop audio session. So a `list_output_devices` call that catches the device free, followed by a `start` call moments later that catches it busy, fails with `DeviceNotFound` even though the user just clicked a row that was visibly there.
+
+To make every device that ever appeared in a listing reusable for `start`, both calls go through a stateful `DeviceCatalog`:
+
+- `DeviceCatalog::list_output_devices()` enumerates **and** caches the `cpal::Device` handles it returns. Holding the `cpal::Device` keeps the underlying ALSA `snd_pcm_t` open (cpal stores it as `Arc<Mutex<DeviceHandles>>`), so PipeWire cannot make us forget how to find it.
+- `DeviceCatalog::start(spec)` looks the requested `device_id` up in the cache **first**. On hit we use the cached `cpal::Device` directly; on miss we fall back to enumeration (so an agent that supplies a remembered id without listing first still works, at the original race risk).
+- Each `list_output_devices` call replaces the cache entirely. Devices that disappeared get evicted and their handles drop, freeing the underlying ALSA references.
+
+Side-effect: since we hold the PCM open, the device is exclusively ours from the moment the catalog lists it until the catalog is dropped (or replaced by another `list_output_devices` call that doesn't include it). For a DAW this is the correct semantic — Bitwig / Reaper / Pro Tools all grab the audio interface exclusively.
+
+Cross-platform: `cpal::Device` is `Send + Sync` on every backend Octave targets (ALSA via `Arc<Mutex<…>>`; CoreAudio is POD; WASAPI declares it explicitly). The catalog is therefore safe to share across threads behind its internal `Mutex<HashMap<DeviceId, cpal::Device>>`.
+
 ### 3.4 Engine layer — RT side
 
 The cpal output callback is wrapped in `assert_no_alloc::assert_no_alloc(...)`[^assert-no-alloc] (debug builds only — release strips). Per buffer the callback:
@@ -175,7 +190,7 @@ The active session is referenced by an opaque `session_id` (UUID); the typed Rus
 
 ### 3.8 API layer
 
-See [§9](#9-api-surface). Strict separation between handle methods (`start`, `pause`, `resume`, `stop`, `seek`, `position_frames`, `peak_dbfs`, `rms_dbfs`, `state`, `xrun_count`, `close`) and free functions (`list_output_devices`, `output_device_capabilities`).
+See [§9](#9-api-surface). Strict separation between handle methods on `PlaybackHandle` (`pause`, `resume`, `stop`, `seek`, `position_frames`, `peak_dbfs`, `rms_dbfs`, `state`, `xrun_count`, `close`) and catalog methods on `DeviceCatalog` (`list_output_devices`, `output_device_capabilities`, `start`) — see [§3.3.1](#331-device-handle-caching--devicecatalog).
 
 ### 3.9 MCP layer
 
@@ -529,6 +544,8 @@ Identical enforcement to recording:
 | Sample-rate mismatch | File rate ≠ device rate | Pre-flight check before stream build | `start()` fails with `RateMismatch { source, device }` | None | UI offers to open device at file rate |
 | Channel-count mismatch | File channels ≠ device channels | Pre-flight check | `start()` fails with `ChannelMismatch { source, device }` | None | UI offers to open device with matching channels |
 | Output device unplugged | USB removed mid-play | cpal error callback `DeviceNotAvailable` | Playback stops at last good sample, toast: "Output disconnected" | None (v1) | User reconnects, re-starts |
+| Stale cached device handle | User unplugs device after `list_output_devices` but before `start` | `cpal::build_output_stream` returns `BackendError` | `start` fails with `BuildStreamFailed`; catalog still holds a dead `cpal::Device` until next `list_output_devices` call | None (v1) | User re-lists, picks a still-present device |
+| Listing missed a busy device | PipeWire held a `hw:` PCM exclusively at the exact moment `list_output_devices` ran | Device absent from the returned `Vec` | UI shows fewer devices than `/proc/asound/cards`; user can re-list to retry. Once it appears, see §3.3.1 — `start` will succeed via the cache | None | User re-lists, or picks `default` / `pipewire` (always present) |
 | xrun (output under-run) | RT thread didn't service buffer in time | Ring empty when callback fires | `xrun_count` increments, audible glitch (one period of silence), toast on every 10th xrun | None | Suggest larger buffer / lower CPU load |
 | Reader thread panics | Bug, OOM, file-system error | Reader thread join detects panic | Playback stops, state → `Errored`, error text surfaced | None | Bug report; user re-starts |
 | Disk read slow → ring drains | Spinning HDD, network FS, OS pause | xrun_count climbs; ring residency monitored | Same as xrun above; documented threshold for "consider faster storage" toast | None | Move source to faster storage |
@@ -606,6 +623,12 @@ pub enum PlaybackState {
 
 pub struct PlaybackHandle { /* opaque, !Send */ }
 
+/// Owns the cached `cpal::Device` handles from the most recent
+/// `list_output_devices()` call so `start()` doesn't have to
+/// re-enumerate (and lose to the PipeWire ALSA exclusive-grab race).
+/// One per long-lived component — see §3.3.1.
+pub struct DeviceCatalog { /* opaque, Send + Sync */ }
+
 #[derive(Debug, Clone)]
 pub struct PlaybackStatus {
     pub state: PlaybackState,
@@ -627,11 +650,14 @@ pub struct PlaybackLevels {
 
 ### 9.2 Operations
 
+`list_output_devices`, `output_device_capabilities`, and `start` are methods on `DeviceCatalog` (see §3.3.1) — the catalog owns the `cpal::Device` cache that makes `start` survive PipeWire's ALSA exclusive-grab race. Callers that want the cached path keep one catalog per long-lived component (one per Tauri actor, one per MCP actor). `Default` builds an empty catalog; first `list_output_devices` populates it.
+
 | Operation | Signature | Pre | Post | Errors | Stability |
 |---|---|---|---|---|---|
-| `list_output_devices` | `fn list_output_devices() -> Vec<OutputDeviceInfo>` | — | All enumerable output devices | — | stable |
-| `output_device_capabilities` | `fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, OpenError>` | — | Supported configs | `DeviceNotFound`, `BackendError` | stable |
-| `start` | `fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError>` | spec valid against capabilities; no other session active | Handle in `Playing` state, audio flowing | `DeviceNotFound`, `BackendError`, `SourceUnreadable`, `RateUnsupportedByDevice`, `ChannelsUnsupportedByDevice`, `BufferSizeOutOfRange`, `NoMatchingStreamConfig`, `BuildStreamFailed`, `PlayStreamFailed`, `AlreadyPlaying` | stable |
+| `DeviceCatalog::new` | `fn new() -> Self` | — | Empty catalog | — | stable |
+| `DeviceCatalog::list_output_devices` | `fn list_output_devices(&self) -> Vec<OutputDeviceInfo>` | — | All enumerable output devices; cache replaced with their `cpal::Device` handles | — | stable |
+| `DeviceCatalog::output_device_capabilities` | `fn output_device_capabilities(&self, id: &DeviceId) -> Result<OutputCapabilities, DeviceError>` | — | Supported configs (cache hit if listed; enumeration fallback otherwise) | `DeviceNotFound`, `BackendError` | stable |
+| `DeviceCatalog::start` | `fn start(&self, spec: PlaybackSpec) -> Result<PlaybackHandle, StartError>` | spec valid against capabilities; no other session active | Handle in `Playing` state, audio flowing. Uses cached `cpal::Device` when available — see §3.3.1 | `DeviceNotFound`, `BackendError`, `SourceUnreadable`, `RateUnsupportedByDevice`, `ChannelsUnsupportedByDevice`, `BufferSizeOutOfRange`, `NoMatchingStreamConfig`, `BuildStreamFailed`, `PlayStreamFailed`, `AlreadyPlaying` | stable |
 | `pause` | `fn pause(&mut self) -> Result<(), TransportError>` | state == `Playing` | state == `Paused`, audio thread halted | `NotPlaying { current }` | stable |
 | `resume` | `fn resume(&mut self) -> Result<(), TransportError>` | state == `Paused` | state == `Playing`, audio resumes from current position | `NotPaused { current }`, `BackendFailed` (rebuild path) | stable |
 | `stop` | `fn stop(&mut self) -> Result<PlaybackStatus, StopError>` | state ∈ {`Playing`, `Paused`, `Ended`} | state == `Stopped`, stream dropped | `NotActive { current }` | stable |

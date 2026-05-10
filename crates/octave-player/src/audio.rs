@@ -21,7 +21,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::device::{DeviceError, capabilities_impl, find_device};
+use crate::device::{DeviceCatalog, DeviceError};
 use crate::file_source::{FileSource, OpenFileError};
 use crate::reader::spawn_reader;
 use crate::ring::{DEFAULT_HEADROOM_MS, build_ring};
@@ -30,7 +30,7 @@ use crate::signals::TransportSignals;
 use crate::source::{BufferSource, PlaybackSource};
 use crate::telemetry::Telemetry;
 use crate::types::{
-    BufferSize, DeviceId, OutputCapabilities, OutputDeviceInfo, PlaybackLevels, PlaybackSourceSpec,
+    BufferSize, DeviceId, PlaybackLevels, PlaybackSourceSpec,
     PlaybackSpec, PlaybackState, PlaybackStatus,
 };
 
@@ -46,7 +46,7 @@ fn linear_to_dbfs(x: f32) -> f32 {
     }
 }
 
-/// Errors returned by [`start`].
+/// Errors returned by [`DeviceCatalog::start`].
 #[derive(Debug, Error)]
 pub enum StartError {
     #[error("device not found: {0:?}")]
@@ -134,6 +134,17 @@ struct Internals {
     /// pipeline on backends where `cpal::Stream::pause` silently
     /// no-ops (PipeWire ALSA bridge in particular).
     spec: PlaybackSpec,
+    /// Cloned from the `DeviceCatalog`'s cached `cpal::Device` at
+    /// `start()` time. Reused by [`PlaybackHandle::resume`]'s rebuild
+    /// path so we don't re-enumerate (plan §3.3.1) — and so the handle
+    /// stays self-contained (no borrow of the catalog past `start()`).
+    /// `cpal::Device` is `Clone + Send + Sync` on every backend.
+    ///
+    /// `None` only on the test fixture in `handle_for_test`, which
+    /// never exercises the rebuild path. Real handles built by
+    /// `start()` always carry `Some`. Resume unwraps with an explicit
+    /// message if it's ever `None`.
+    device: Option<cpal::Device>,
     /// `true` once we've observed pause silently failing — `pause`
     /// dropped the stream + reader and `resume` must rebuild rather
     /// than calling `stream.play`.
@@ -197,82 +208,81 @@ const PAUSE_VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// in 8 ms at any sample rate).
 const PAUSE_VERIFY_GRACE_FRAMES: u64 = 4_096;
 
-/// Opaque handle returned by [`start`]. `!Send` (cpal's `Stream` is
-/// `!Send` on every backend) — keep it on the thread that opened it.
+/// Opaque handle returned by [`DeviceCatalog::start`]. `!Send` (cpal's
+/// `Stream` is `!Send` on every backend) — keep it on the thread that
+/// opened it.
 pub struct PlaybackHandle {
     inner: Internals,
 }
 
-/// Public entry point: enumerate every output device the platform sees.
-pub fn list_output_devices() -> Vec<OutputDeviceInfo> {
-    crate::device::list_output_devices_impl()
-}
+impl DeviceCatalog {
+    /// Open the output device, load the source, build and start the
+    /// cpal output stream, spawn the reader thread. On success the
+    /// returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
+    ///
+    /// Uses the cached `cpal::Device` for `spec.device_id` when
+    /// present (i.e. when this catalog has called
+    /// [`Self::list_output_devices`] since startup) — see plan §3.3.1
+    /// for why that matters on Linux. Cache miss falls through to
+    /// fresh enumeration.
+    ///
+    /// Plan §3.7 / §13.3 single-session enforcement: a process-global
+    /// slot is claimed at the top of this call and released by
+    /// [`PlaybackHandle::close`] (or its `Drop`). A second concurrent
+    /// caller gets [`StartError::AlreadyPlaying { current_session }`].
+    pub fn start(&self, spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
+        // Claim the slot before spending any I/O / cpal cycles. Released
+        // below on every error path and by close()/Drop on success.
+        let session_id = acquire_session()?;
 
-/// Public entry point: ask one output device about its supported
-/// sample rates, buffer sizes, and channel counts.
-pub fn output_device_capabilities(id: &DeviceId) -> Result<OutputCapabilities, DeviceError> {
-    crate::device::capabilities_impl(id)
-}
-
-/// Public entry point: open the output device, load the source, build
-/// and start the cpal output stream, spawn the reader thread. On
-/// success the returned [`PlaybackHandle`] is in [`PlaybackState::Playing`].
-///
-/// Plan §3.7 / §13.3 single-session enforcement: a process-global
-/// slot is claimed at the top of this call and released by
-/// [`PlaybackHandle::close`] (or its `Drop`). A second concurrent
-/// caller gets [`StartError::AlreadyPlaying { current_session }`].
-pub fn start(spec: PlaybackSpec) -> Result<PlaybackHandle, StartError> {
-    // Claim the slot before spending any I/O / cpal cycles. Released
-    // below on every error path and by close()/Drop on success.
-    let session_id = acquire_session()?;
-
-    // From here on, any early return must release the slot.
-    let result = (|| -> Result<PlaybackHandle, StartError> {
-        let device = find_device(&spec.device_id)?;
-        let ConstructedSource {
-            source,
-            sample_rate: source_rate,
-            channels: source_channels,
-            duration_frames,
-        } = construct_source(&spec.source)?;
-
-        validate_source_against_device(&spec.device_id, source_rate, source_channels)?;
-
-        let telemetry = Arc::new(Telemetry::new(source_channels));
-        let signals = Arc::new(TransportSignals::new());
-
-        let (stream, reader_join) = build_running_pipeline(
-            &device,
-            source,
-            source_rate,
-            source_channels,
-            spec.buffer_size,
-            Arc::clone(&telemetry),
-            Arc::clone(&signals),
-        )?;
-
-        Ok(PlaybackHandle {
-            inner: Internals {
-                state: PlaybackState::Playing,
-                session_id,
+        // From here on, any early return must release the slot.
+        let result = (|| -> Result<PlaybackHandle, StartError> {
+            let device = self.find_device(&spec.device_id)?;
+            let ConstructedSource {
+                source,
                 sample_rate: source_rate,
                 channels: source_channels,
                 duration_frames,
-                telemetry,
-                signals,
-                stream: Some(stream),
-                reader_join: Some(reader_join),
-                spec,
-                paused_via_drop: false,
-            },
-        })
-    })();
+            } = construct_source(&spec.source)?;
 
-    if result.is_err() {
-        release_session(session_id);
+            validate_source_against_device(self, &spec.device_id, source_rate, source_channels)?;
+
+            let telemetry = Arc::new(Telemetry::new(source_channels));
+            let signals = Arc::new(TransportSignals::new());
+
+            let (stream, reader_join) = build_running_pipeline(
+                &device,
+                source,
+                source_rate,
+                source_channels,
+                spec.buffer_size,
+                Arc::clone(&telemetry),
+                Arc::clone(&signals),
+            )?;
+
+            Ok(PlaybackHandle {
+                inner: Internals {
+                    state: PlaybackState::Playing,
+                    session_id,
+                    sample_rate: source_rate,
+                    channels: source_channels,
+                    duration_frames,
+                    telemetry,
+                    signals,
+                    stream: Some(stream),
+                    reader_join: Some(reader_join),
+                    spec,
+                    device: Some(device),
+                    paused_via_drop: false,
+                },
+            })
+        })();
+
+        if result.is_err() {
+            release_session(session_id);
+        }
+        result
     }
-    result
 }
 
 /// Constructed-source bundle returned by [`construct_source`].
@@ -324,11 +334,12 @@ fn construct_source(source_spec: &PlaybackSourceSpec) -> Result<ConstructedSourc
 }
 
 fn validate_source_against_device(
+    catalog: &DeviceCatalog,
     device_id: &DeviceId,
     source_rate: u32,
     source_channels: u16,
 ) -> Result<(), StartError> {
-    let caps = capabilities_impl(device_id)?;
+    let caps = catalog.output_device_capabilities(device_id)?;
     if !caps.supported_sample_rates.contains(&source_rate) {
         return Err(StartError::RateUnsupportedByDevice {
             requested: source_rate,
@@ -557,9 +568,18 @@ impl PlaybackHandle {
             return Ok(());
         }
 
-        // Rebuild path.
-        let device = find_device(&self.inner.spec.device_id)
-            .map_err(|e| TransportError::BackendFailed(format!("{e}")))?;
+        // Rebuild path. Reuse the cpal::Device cached on `Internals`
+        // at `start()` time — no re-enumeration, no PipeWire race
+        // (plan §3.3.1). The Option is only `None` on test-fixture
+        // handles which don't reach this path; surface a clear error
+        // rather than silently degrading.
+        let device = self
+            .inner
+            .device
+            .clone()
+            .ok_or_else(|| TransportError::BackendFailed(
+                "internal: rebuild path reached on a handle without a cached device".into(),
+            ))?;
         let ConstructedSource {
             mut source,
             sample_rate: source_rate,
@@ -822,6 +842,7 @@ mod tests {
                     },
                     buffer_size: BufferSize::Default,
                 },
+                device: None,
                 paused_via_drop: false,
             },
         }

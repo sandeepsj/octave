@@ -13,12 +13,13 @@
 //! play/stop, so the actor matches: `start` while something is already
 //! playing returns [`PlaybackStartError::AlreadyPlaying`].
 
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tokio::sync::oneshot;
 
-use octave_player::{self as player, PlaybackHandle, PlaybackSpec, PlaybackStatus};
+use octave_player::{DeviceCatalog, PlaybackHandle, PlaybackSpec, PlaybackStatus};
 
 /// Bounded so a runaway producer can't grow the queue without limit.
 /// 16 is plenty: the UI sends one command per click, the actor
@@ -33,18 +34,28 @@ pub struct AppActorHandle {
     /// Without it the actor's `rx.recv()` would never see the close,
     /// and `handle.join()` would deadlock.
     tx: Option<Sender<Command>>,
-    join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    /// Output-device catalog shared between the synchronous
+    /// `list_output_devices` Tauri command and the actor thread that
+    /// calls `catalog.start(...)`. Holding the same catalog across
+    /// list and start is what defeats the PipeWire ALSA enumerate-race
+    /// (plan §3.3.1) — `start` reuses the cpal::Device the listing
+    /// already opened.
+    catalog: Arc<DeviceCatalog>,
 }
 
 impl AppActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
+        let catalog = Arc::new(DeviceCatalog::new());
+        let actor_catalog = Arc::clone(&catalog);
         let join = thread::Builder::new()
             .name("octave-app-audio".into())
-            .spawn(move || run_actor(rx))?;
+            .spawn(move || run_actor(rx, actor_catalog))?;
         Ok(Self {
             tx: Some(tx),
-            join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
+            join: Arc::new(std::sync::Mutex::new(Some(join))),
+            catalog,
         })
     }
 
@@ -56,12 +67,19 @@ impl AppActorHandle {
             Err(TrySendError::Disconnected(_)) => Err(ActorError::Gone),
         }
     }
+
+    /// Borrow the actor's [`DeviceCatalog`] for the read-only
+    /// `list_output_devices` Tauri command. The catalog is `Send + Sync`,
+    /// so concurrent commands share it safely.
+    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
+        &self.catalog
+    }
 }
 
 impl Drop for AppActorHandle {
     fn drop(&mut self) {
         let _ = self.tx.take();
-        if std::sync::Arc::strong_count(&self.join) > 1 {
+        if Arc::strong_count(&self.join) > 1 {
             return;
         }
         if let Ok(mut guard) = self.join.lock() {
@@ -113,7 +131,7 @@ pub enum PlaybackStopError {
     Stop(String),
 }
 
-fn run_actor(rx: Receiver<Command>) {
+fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
     let mut active: Option<PlaybackHandle> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -122,7 +140,7 @@ fn run_actor(rx: Receiver<Command>) {
                     let _ = reply.send(Err(PlaybackStartError::AlreadyPlaying));
                     continue;
                 }
-                match player::start(spec) {
+                match catalog.start(spec) {
                     Ok(handle) => {
                         let status = handle.status();
                         active = Some(handle);

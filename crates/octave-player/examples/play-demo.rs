@@ -18,8 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use octave_player::{
-    BufferSize, PlaybackSourceSpec, PlaybackSpec, PlaybackState, list_output_devices,
-    output_device_capabilities, start,
+    BufferSize, DeviceCatalog, PlaybackSourceSpec, PlaybackSpec, PlaybackState,
 };
 
 fn main() -> ExitCode {
@@ -30,7 +29,11 @@ fn main() -> ExitCode {
     }
     let input_path = PathBuf::from(&args[1]);
 
-    let devices = list_output_devices();
+    // One catalog for the lifetime of the demo. `list` populates the
+    // device-handle cache; `start` reuses it (plan §3.3.1) so the demo
+    // doesn't lose to PipeWire's ALSA exclusive-grab race.
+    let catalog = DeviceCatalog::new();
+    let devices = catalog.list_output_devices();
     if devices.is_empty() {
         eprintln!("no output devices found");
         return ExitCode::from(2);
@@ -51,7 +54,7 @@ fn main() -> ExitCode {
         .unwrap_or(&devices[0]);
     println!("\nopening default: {}", default.name);
 
-    let caps = match output_device_capabilities(&default.id) {
+    let caps = match catalog.output_device_capabilities(&default.id) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("output_device_capabilities failed: {e}");
@@ -67,7 +70,7 @@ fn main() -> ExitCode {
         buffer_size: BufferSize::Default,
     };
 
-    let mut handle = match start(spec) {
+    let mut handle = match catalog.start(spec) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("start failed: {e}");

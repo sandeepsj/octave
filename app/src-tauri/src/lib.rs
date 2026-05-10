@@ -42,9 +42,11 @@ struct OutputDeviceInfo {
 }
 
 #[tauri::command]
-fn list_output_devices() -> Vec<OutputDeviceInfo> {
+fn list_output_devices(actor: tauri::State<'_, AppActorHandle>) -> Vec<OutputDeviceInfo> {
     let alsa_long_names = read_alsa_card_long_names();
-    octave_player::list_output_devices()
+    actor
+        .catalog()
+        .list_output_devices()
         .into_iter()
         .map(|d| OutputDeviceInfo {
             friendly_name: alsa_friendly_name(&d.name, &alsa_long_names),

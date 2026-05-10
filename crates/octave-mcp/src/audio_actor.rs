@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
@@ -24,9 +25,7 @@ use octave_recorder::{
     RecordingSpec, StopError,
 };
 
-use octave_player::{
-    self as player, PlaybackHandle, PlaybackSpec,
-};
+use octave_player::{DeviceCatalog, PlaybackHandle, PlaybackSpec};
 
 use crate::types::{
     LevelsResult, PlaybackSeekResult, PlaybackStatusJson, PlaybackTransportResult,
@@ -53,18 +52,29 @@ pub struct AudioActorHandle {
     /// `Drop` (the last clone) `take` and join the thread; subsequent
     /// drops see `None` and skip. The `Mutex` is uncontended on the
     /// happy path — only `Drop` ever touches it.
-    join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    join: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    /// Output-device catalog shared between read-only handler tools
+    /// (`playback_list_output_devices`, `playback_describe_device`)
+    /// and the actor thread that calls `catalog.start(...)`. One Arc
+    /// per actor instance — the cache it owns survives across all
+    /// list / describe / start calls so `start` can reuse the
+    /// `cpal::Device` from the most recent listing instead of
+    /// re-enumerating (plan §3.3.1).
+    catalog: Arc<DeviceCatalog>,
 }
 
 impl AudioActorHandle {
     pub fn spawn() -> std::io::Result<Self> {
         let (tx, rx) = bounded::<Command>(COMMAND_QUEUE);
+        let catalog = Arc::new(DeviceCatalog::new());
+        let actor_catalog = Arc::clone(&catalog);
         let join = thread::Builder::new()
             .name("octave-mcp-audio".into())
-            .spawn(move || run_actor(rx))?;
+            .spawn(move || run_actor(rx, actor_catalog))?;
         Ok(Self {
             tx: Some(tx),
-            join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
+            join: Arc::new(std::sync::Mutex::new(Some(join))),
+            catalog,
         })
     }
 
@@ -77,6 +87,13 @@ impl AudioActorHandle {
             Err(TrySendError::Full(_)) => Err(ActorError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(ActorError::Gone),
         }
+    }
+
+    /// Borrow the actor's [`DeviceCatalog`] for read-only tools
+    /// (listing / describing devices). The catalog is `Send + Sync`,
+    /// so concurrent tool calls share it safely.
+    pub fn catalog(&self) -> &Arc<DeviceCatalog> {
+        &self.catalog
     }
 }
 
@@ -92,7 +109,7 @@ impl Drop for AudioActorHandle {
         // actor thread. Earlier clones see strong_count > 1 and skip
         // — the next-to-last clone's Drop will try, and the very
         // last one will succeed.
-        if std::sync::Arc::strong_count(&self.join) > 1 {
+        if Arc::strong_count(&self.join) > 1 {
             return;
         }
         if let Ok(mut guard) = self.join.lock() {
@@ -245,10 +262,10 @@ struct ActorState {
     playback: Option<PlaybackSession>,
 }
 
-fn run_actor(rx: Receiver<Command>) {
+fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
     let mut state = ActorState::default();
     while let Ok(cmd) = rx.recv() {
-        handle_command(cmd, &mut state);
+        handle_command(cmd, &mut state, &catalog);
     }
     // Channel closed → drain and close everything.
     for (_, mut s) in state.recording.drain() {
@@ -261,7 +278,7 @@ fn run_actor(rx: Receiver<Command>) {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn handle_command(cmd: Command, state: &mut ActorState) {
+fn handle_command(cmd: Command, state: &mut ActorState, catalog: &DeviceCatalog) {
     match cmd {
         Command::StartRecording {
             spec,
@@ -349,7 +366,7 @@ fn handle_command(cmd: Command, state: &mut ActorState) {
         //   Playback handlers
         // ============================================================
         Command::PlaybackStart { spec, reply } => {
-            let result = start_playback(spec, &mut state.playback);
+            let result = start_playback(spec, &mut state.playback, catalog);
             let _ = reply.send(result);
         }
         Command::PlaybackPause { session_id, reply } => {
@@ -465,13 +482,16 @@ fn playback_transport(ps: &PlaybackSession) -> PlaybackTransportResult {
 fn start_playback(
     spec: PlaybackSpec,
     playback: &mut Option<PlaybackSession>,
+    catalog: &DeviceCatalog,
 ) -> Result<PlaybackStartReply, PlaybackStartError> {
     if let Some(ps) = playback.as_ref() {
         return Err(PlaybackStartError::AlreadyPlaying {
             current_session: ps.session_id,
         });
     }
-    let handle = player::start(spec).map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
+    let handle = catalog
+        .start(spec)
+        .map_err(|e| PlaybackStartError::Start(format!("{e}")))?;
     let session_id = Uuid::new_v4();
     let started_at = SystemTime::now();
     let status = handle.status();

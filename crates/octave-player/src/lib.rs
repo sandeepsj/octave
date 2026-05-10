@@ -14,7 +14,7 @@
 //!
 //! Working end-to-end: device enumeration + capability query, file
 //! source (WAV / RF64), in-memory buffer source, RT output callback
-//! with seek/EOF handshake atomics, reader thread, [`start`] /
+//! with seek/EOF handshake atomics, reader thread, [`DeviceCatalog::start`] /
 //! [`PlaybackHandle::pause`] / [`PlaybackHandle::resume`] (with the
 //! verify-and-rebuild fallback for the cpal pause silent-no-op trap)
 //! / [`PlaybackHandle::seek`] / [`PlaybackHandle::stop`] /
@@ -39,9 +39,8 @@ mod wav;
 
 pub use audio::{
     PlaybackHandle, SeekError as PlaybackSeekError, StartError, StopError, TransportError,
-    list_output_devices, output_device_capabilities, start,
 };
-pub use device::DeviceError;
+pub use device::{DeviceCatalog, DeviceError};
 pub use file_source::{FileSource, OpenFileError};
 pub use source::{BufferSource, PlaybackSource, SeekError};
 pub use types::{

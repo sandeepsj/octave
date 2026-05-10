@@ -291,7 +291,10 @@ impl OctaveServer {
     async fn playback_list_output_devices(
         &self,
     ) -> Result<Json<ListOutputDevicesResult>, ErrorData> {
-        let devices = octave_player::list_output_devices()
+        let devices = self
+            .actor
+            .catalog()
+            .list_output_devices()
             .into_iter()
             .map(OutputDeviceInfoJson::from)
             .collect();
@@ -307,7 +310,7 @@ impl OctaveServer {
         Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
     ) -> Result<Json<CapabilitiesJson>, ErrorData> {
         let id = octave_player::DeviceId(device_id);
-        match octave_player::output_device_capabilities(&id) {
+        match self.actor.catalog().output_device_capabilities(&id) {
             Ok(c) => Ok(Json(c.into())),
             Err(e) => Err(ErrorData::invalid_params(
                 format_typed_error("DeviceError", &e),
