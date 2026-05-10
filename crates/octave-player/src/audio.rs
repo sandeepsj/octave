@@ -61,7 +61,7 @@ pub enum StartError {
     ChannelsUnsupportedByDevice { requested: u16, supported: Vec<u16> },
     #[error("buffer size {requested} out of range [{min}, {max}]")]
     BufferSizeOutOfRange { requested: u32, min: u32, max: u32 },
-    #[error("device exposes no f32 stream config matching {sample_rate} Hz / {channels} ch")]
+    #[error("device exposes no f32/i32/i16 stream config matching {sample_rate} Hz / {channels} ch")]
     NoMatchingStreamConfig { sample_rate: u32, channels: u16 },
     #[error("failed to build cpal output stream: {0}")]
     BuildStreamFailed(String),
@@ -355,6 +355,39 @@ fn validate_source_against_device(
     Ok(())
 }
 
+/// Per-channel scratch ceiling for the I32 / I16 conversion paths.
+/// 16 384 frames is ~341 ms at 48 kHz — well above any realistic
+/// cpal callback (typical Default buffers are 256-2048 frames). If
+/// cpal ever exceeds this, the callback silences and returns rather
+/// than allocating in the RT path.
+const MAX_SCRATCH_FRAMES: usize = 16_384;
+
+// 2^31 and 2^15 are pure powers of two well inside the f32 exponent
+// range, so they're bit-exact in f32 despite clippy's general
+// `lossy_float_literal` heuristic flagging the decimal literals.
+// This is the standard audio "2's-complement-asymmetric" scale: at
+// f32 = 1.0 the i32 cast saturates one LSB short of i32::MAX
+// (inaudible); at f32 = -1.0 it lands exactly on i32::MIN.
+#[allow(clippy::lossy_float_literal)]
+const I32_SCALE: f32 = 2_147_483_648.0_f32;
+#[allow(clippy::lossy_float_literal)]
+const I16_SCALE: f32 = 32_768.0_f32;
+
+/// f32 -> i32: clamp to [-1, 1], scale, cast saturating. Pure,
+/// allocation-free. Per plan §3.4.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn f32_to_i32(s: f32) -> i32 {
+    (s.clamp(-1.0, 1.0) * I32_SCALE) as i32
+}
+
+/// f32 -> i16: clamp to [-1, 1], scale, cast saturating.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn f32_to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * I16_SCALE) as i16
+}
+
 /// Build the cpal output stream + spawn the reader thread + start the
 /// stream. Used both by initial `start` and by `resume`'s rebuild path.
 /// Sleeps `PRE_ROLL_MS` before `stream.play()` so the very first
@@ -368,13 +401,33 @@ fn build_running_pipeline(
     telemetry: Arc<Telemetry>,
     signals: Arc<TransportSignals>,
 ) -> Result<(cpal::Stream, JoinHandle<()>), StartError> {
-    // Pick the f32 config that matches the source's rate + channels.
+    // Pick a config matching the source's rate + channels. Preferred
+    // formats (in order): F32 (no conversion), I32 (full-precision
+    // integer), I16. See plan §3.3 — every Linux hw:CARD= device is
+    // I32 or I16; F32 only appears on PipeWire/dmix bridge devices and
+    // on macOS / Windows defaults.
     let supported = device
         .supported_output_configs()
         .map_err(|e| StartError::BackendError(format!("supported_output_configs: {e}")))?;
-    let chosen = supported
-        .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == channels)
-        .find(|c| c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate)
+    let mut acceptable: Vec<_> = supported
+        .filter(|c| c.channels() == channels)
+        .filter(|c| c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate)
+        .filter(|c| {
+            matches!(
+                c.sample_format(),
+                cpal::SampleFormat::F32 | cpal::SampleFormat::I32 | cpal::SampleFormat::I16
+            )
+        })
+        .collect();
+    acceptable.sort_by_key(|c| match c.sample_format() {
+        cpal::SampleFormat::F32 => 0,
+        cpal::SampleFormat::I32 => 1,
+        cpal::SampleFormat::I16 => 2,
+        _ => 3,
+    });
+    let chosen = acceptable
+        .into_iter()
+        .next()
         .ok_or(StartError::NoMatchingStreamConfig {
             sample_rate,
             channels,
@@ -402,31 +455,117 @@ fn build_running_pipeline(
     };
 
     let (producer, consumer) = build_ring(sample_rate, channels, DEFAULT_HEADROOM_MS);
-    let telemetry_cb = Arc::clone(&telemetry);
-    let signals_cb = Arc::clone(&signals);
     let mut consumer_cb = consumer;
     let channels_cb = channels;
+    let scratch_size = MAX_SCRATCH_FRAMES * usize::from(channels);
+    let err_cb = |err: cpal::StreamError| {
+        tracing::error!(?err, "cpal output stream error");
+    };
 
-    let stream = device
-        .build_output_stream(
-            &stream_config,
-            move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                assert_no_alloc::assert_no_alloc(|| {
-                    process_output_buffer(
-                        out,
-                        channels_cb,
-                        &telemetry_cb,
-                        &mut consumer_cb,
-                        &signals_cb,
-                    );
-                });
-            },
-            |err| {
-                tracing::error!(?err, "cpal output stream error");
-            },
-            None,
-        )
-        .map_err(|e| StartError::BuildStreamFailed(e.to_string()))?;
+    let stream = match chosen.sample_format() {
+        cpal::SampleFormat::F32 => {
+            // No conversion — process_output_buffer writes directly into out.
+            let telemetry_cb = Arc::clone(&telemetry);
+            let signals_cb = Arc::clone(&signals);
+            device
+                .build_output_stream(
+                    &stream_config,
+                    move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            process_output_buffer(
+                                out,
+                                channels_cb,
+                                &telemetry_cb,
+                                &mut consumer_cb,
+                                &signals_cb,
+                            );
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| StartError::BuildStreamFailed(e.to_string()))?
+        }
+        cpal::SampleFormat::I32 => {
+            let telemetry_cb = Arc::clone(&telemetry);
+            let signals_cb = Arc::clone(&signals);
+            let mut scratch = vec![0.0_f32; scratch_size];
+            device
+                .build_output_stream(
+                    &stream_config,
+                    move |out: &mut [i32], _info: &cpal::OutputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            let n = out.len();
+                            if n > scratch.len() {
+                                for s in out.iter_mut() {
+                                    *s = 0;
+                                }
+                                return;
+                            }
+                            let work = &mut scratch[..n];
+                            process_output_buffer(
+                                work,
+                                channels_cb,
+                                &telemetry_cb,
+                                &mut consumer_cb,
+                                &signals_cb,
+                            );
+                            for (dst, src) in out.iter_mut().zip(work.iter()) {
+                                *dst = f32_to_i32(*src);
+                            }
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| StartError::BuildStreamFailed(e.to_string()))?
+        }
+        cpal::SampleFormat::I16 => {
+            let telemetry_cb = Arc::clone(&telemetry);
+            let signals_cb = Arc::clone(&signals);
+            let mut scratch = vec![0.0_f32; scratch_size];
+            device
+                .build_output_stream(
+                    &stream_config,
+                    move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+                        assert_no_alloc::assert_no_alloc(|| {
+                            let n = out.len();
+                            if n > scratch.len() {
+                                for s in out.iter_mut() {
+                                    *s = 0;
+                                }
+                                return;
+                            }
+                            let work = &mut scratch[..n];
+                            process_output_buffer(
+                                work,
+                                channels_cb,
+                                &telemetry_cb,
+                                &mut consumer_cb,
+                                &signals_cb,
+                            );
+                            for (dst, src) in out.iter_mut().zip(work.iter()) {
+                                *dst = f32_to_i16(*src);
+                            }
+                        });
+                    },
+                    err_cb,
+                    None,
+                )
+                .map_err(|e| StartError::BuildStreamFailed(e.to_string()))?
+        }
+        // The `acceptable` filter rejects any other format; reachable
+        // only if cpal grows a new variant we forgot to filter.
+        other => {
+            return Err(StartError::NoMatchingStreamConfig {
+                sample_rate,
+                channels,
+            })
+            .inspect_err(|_| {
+                tracing::error!(?other, "unexpected sample format slipped past filter");
+            });
+        }
+    };
 
     // Spawn the reader, then give it 50 ms to prime the ring before
     // `stream.play()` so the very first cpal callback finds samples
@@ -846,6 +985,67 @@ mod tests {
                 paused_via_drop: false,
             },
         }
+    }
+
+    // ---------- f32 -> i32 / i16 conversion ----------
+
+    #[test]
+    fn f32_to_i32_silence_is_zero() {
+        assert_eq!(f32_to_i32(0.0), 0);
+    }
+
+    #[test]
+    fn f32_to_i32_full_scale_positive_is_max() {
+        // +1.0 * 2^31 = 2_147_483_648.0 → saturates to i32::MAX.
+        assert_eq!(f32_to_i32(1.0), i32::MAX);
+    }
+
+    #[test]
+    fn f32_to_i32_full_scale_negative_is_min() {
+        // -1.0 * 2^31 = -2_147_483_648.0 → exact i32::MIN.
+        assert_eq!(f32_to_i32(-1.0), i32::MIN);
+    }
+
+    #[test]
+    fn f32_to_i32_clamps_above_unity() {
+        // Sources can rarely overshoot; clamp prevents wrap-around.
+        assert_eq!(f32_to_i32(1.5), i32::MAX);
+        assert_eq!(f32_to_i32(-1.5), i32::MIN);
+        assert_eq!(f32_to_i32(f32::INFINITY), i32::MAX);
+        assert_eq!(f32_to_i32(f32::NEG_INFINITY), i32::MIN);
+    }
+
+    #[test]
+    fn f32_to_i32_half_scale_is_two_to_thirtieth() {
+        // 0.5 * 2^31 = 2^30. Rust rounds float→int via truncation; the
+        // multiplication itself is exact in f32 here, so the result is
+        // exactly 2^30 (give or take 1 ulp from f32 mantissa).
+        let got = f32_to_i32(0.5);
+        let want: i32 = 1 << 30;
+        assert!(
+            (got - want).abs() <= 1,
+            "f32_to_i32(0.5) was {got}, expected ~{want}"
+        );
+    }
+
+    #[test]
+    fn f32_to_i16_silence_full_scale_and_clamp() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), i16::MAX); // 1.0 * 2^15 saturates to 32767
+        assert_eq!(f32_to_i16(-1.0), i16::MIN); // -1.0 * 2^15 = -32768
+        assert_eq!(f32_to_i16(2.0), i16::MAX);
+        assert_eq!(f32_to_i16(-2.0), i16::MIN);
+        // 0.5 * 2^15 = 16384 (exact in f32).
+        assert_eq!(f32_to_i16(0.5), 16384);
+    }
+
+    #[test]
+    fn f32_to_i32_handles_nan_safely() {
+        // NaN.clamp(-1.0, 1.0) returns NaN; NaN as i32 is 0 per Rust spec.
+        // We don't promise audible behavior on NaN sources, only that
+        // the cast doesn't panic or wrap.
+        let got = f32_to_i32(f32::NAN);
+        assert_eq!(got, 0, "NaN must cast to 0, never panic");
     }
 
     // ---------- linear_to_dbfs ----------

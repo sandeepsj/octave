@@ -129,7 +129,9 @@ Identical kernel stack to [`record-audio` §3.2](./record-audio.md#32-driver--ke
 
 ### 3.3 OS / platform abstraction — `cpal`
 
-Same crate as recording[^cpal]; we use the output APIs (`Device::default_output_device()`, `Device::supported_output_configs()`, `Device::build_output_stream(...)`). Stream config (sample-rate, buffer-size, channels, sample-format) mirrors recording. Sample format is **always** `cpal::SampleFormat::F32`.
+Same crate as recording[^cpal]; we use the output APIs (`Device::default_output_device()`, `Device::supported_output_configs()`, `Device::build_output_stream(...)`). Stream config (sample-rate, buffer-size, channels, sample-format) mirrors recording.
+
+**Accepted sample formats: F32, I32, I16.** Preference order at stream-build time: F32 (no conversion needed) > I32 (full-precision integer) > I16. Internally the engine is f32 throughout — the audio thread converts to the device's native format inline (see [§3.4](#34-engine-layer--rt-side)). This matters on Linux: every physical `hw:CARD=` device exposes I32 or I16 natively (USB-Audio is I32-only, HD-Audio is I16+I32). The F32-only filter we shipped before this would reject every direct-hardware device, leaving only the PipeWire / `default` plug devices as the practical playable surface.
 
 #### 3.3.1 Device-handle caching — `DeviceCatalog`
 
@@ -158,6 +160,19 @@ The cpal output callback is wrapped in `assert_no_alloc::assert_no_alloc(...)`[^
 6. On under-run (ring empty when callback fires), writes silence into the requested slots and bumps `xrun_count`.
 
 The audio callback **never allocates, never locks, never blocks**. Same enforcement as the recording side.
+
+**Format conversion in the I32 / I16 paths.** When the chosen stream config is not F32, the cpal callback receives `&mut [T]` for `T ∈ {i32, i16}`. The closure owns a pre-allocated `Vec<f32>` scratch (sized at stream-build time, capped at `MAX_SCRATCH_FRAMES = 16384` frames per channel — well above any realistic RT buffer). Per callback: slice `&mut scratch[..out.len()]`, run [`process_output_buffer`](#34-engine-layer--rt-side) into the slice, then convert sample-by-sample into `out`:
+
+$$
+\text{i32}(s) = (\text{clamp}(s, -1, 1) \cdot 2^{31}) \text{ as i32}
+$$
+$$
+\text{i16}(s) = (\text{clamp}(s, -1, 1) \cdot 2^{15}) \text{ as i16}
+$$
+
+Rust's float-to-int `as` cast saturates at the integer range, so the clamp prevents overflow without any branchy "if greater than max" code. No allocation, no syscall, no lock — RT-safe.
+
+If cpal ever hands a buffer larger than the scratch (would mean we under-sized at build time), the callback silences `out` and returns. Better than allocating in the RT path; the under-sizing would surface as audible silence, then a follow-up audit raises the const.
 
 ### 3.5 Engine layer — Reader side
 
