@@ -196,6 +196,7 @@ async fn playback_stop(
 pub fn run() {
     let actor = AppActorHandle::spawn().expect("failed to spawn audio actor thread");
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(actor)
         .invoke_handler(tauri::generate_handler![
             list_output_devices,

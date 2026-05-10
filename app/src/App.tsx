@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 /// Mirror of the Tauri command's return shape (defined in
 /// app/src-tauri/src/lib.rs — keep in sync).
@@ -94,6 +95,33 @@ export default function App() {
       setDevices(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleChooseFile() {
+    // Multi-platform native picker. WAV-only filter; users on Linux see
+    // hidden files toggled off by default (Tauri delegates to the OS
+    // dialog). `null` means the user cancelled — leave the existing
+    // selection unchanged. A genuine OS-level failure (xdg-portal not
+    // running, permission denied, etc.) throws and is surfaced into
+    // the same error region as playback errors — matching the
+    // try/catch convention used by handleListDevices / handlePlay /
+    // handleStop above.
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "Open WAV file",
+        filters: [{ name: "WAV audio", extensions: ["wav"] }],
+      });
+      if (typeof picked === "string") {
+        setSourcePath(picked);
+        // Cancelling the picker shouldn't clear a stale "Stopped at …" line,
+        // but choosing a new file should — we're starting a new playback intent.
+        setPlayError(null);
+      }
+    } catch (e) {
+      setPlayError(`file picker failed: ${e}`);
     }
   }
 
@@ -226,14 +254,20 @@ export default function App() {
         <section className="mt-10 border-t border-border pt-8">
           <h2 className="text-lg font-semibold mb-3">Play a WAV file</h2>
           <div className="flex gap-2">
-            <input
-              type="text"
-              value={sourcePath}
-              onChange={(e) => setSourcePath(e.target.value)}
-              placeholder="/absolute/path/to/audio.wav"
-              spellCheck={false}
-              className="flex-1 rounded-md bg-elevated border border-border px-3 py-2 font-mono text-sm placeholder:text-muted focus:border-accent focus:outline-none"
-            />
+            <button
+              type="button"
+              onClick={handleChooseFile}
+              disabled={playBusy || !!playInfo}
+              className="rounded-md bg-elevated border border-border px-3 py-2 text-sm hover:border-muted disabled:opacity-50 transition"
+            >
+              {sourcePath ? "Change file…" : "Open WAV…"}
+            </button>
+            <div
+              className="flex-1 rounded-md bg-elevated border border-border px-3 py-2 font-mono text-sm text-muted truncate"
+              title={sourcePath || ""}
+            >
+              {sourcePath || "no file selected"}
+            </div>
             {!playInfo ? (
               <button
                 type="button"

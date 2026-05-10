@@ -3,5 +3,8 @@
   "identifier": "default",
   "description": "Capabilities granted to the main Octave window in v0.1.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
 }
