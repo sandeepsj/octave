@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities granted to the main Octave window and the in-app chat window. Both ride the same SPA bundle (route-switched on URL hash) and need the same `invoke` permissions to reach the Tauri commands that wrap the engine.",
-  "windows": ["main", "chat"],
+  "description": "Capabilities granted to the main Octave window in v0.1.",
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:allow-open"

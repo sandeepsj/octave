@@ -417,23 +417,9 @@ export default function App() {
 
   return (
     <main className="min-h-screen p-8 max-w-2xl mx-auto">
-      <header className="mb-8 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Octave</h1>
-          <p className="text-muted text-sm mt-1">v0.1 — scaffold</p>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            invoke("open_chat_window").catch((e) =>
-              setError(`open_chat_window: ${e}`),
-            );
-          }}
-          className="rounded-md bg-elevated border border-border px-3 py-2 text-sm hover:border-accent transition"
-          title="Open the in-app AI chat (Haiku 4.5 with tool access)"
-        >
-          💬 Chat
-        </button>
+      <header className="mb-8">
+        <h1 className="text-2xl font-semibold tracking-tight">Octave</h1>
+        <p className="text-muted text-sm mt-1">v0.1 — scaffold</p>
       </header>
 
       <button

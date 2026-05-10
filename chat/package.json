@@ -1,0 +1,22 @@
+{
+  "name": "octave-chat",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Standalone CLI agent for Octave. Connects to the octave-mcp server (stdio today; HTTP/SSE LAN transport is the next octave-mcp cycle step) and lets you drive the audio engine via Claude Haiku 4.5.",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3",
+    "@modelcontextprotocol/sdk": "^1",
+    "ai": "^6",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

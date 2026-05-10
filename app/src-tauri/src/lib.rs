@@ -447,26 +447,6 @@ async fn recording_status(
     }))
 }
 
-/// Open the Octave Chat window (or focus it if already open). Same
-/// SPA bundle as the main window; the chat route is selected via the
-/// URL hash (`#/chat`) — see `app/src/main.tsx`.
-#[tauri::command]
-async fn open_chat_window(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-    if let Some(existing) = app.get_webview_window("chat") {
-        existing.show().map_err(|e| format!("{e}"))?;
-        existing.set_focus().map_err(|e| format!("{e}"))?;
-        return Ok(());
-    }
-    WebviewWindowBuilder::new(&app, "chat", WebviewUrl::App("index.html#/chat".into()))
-        .title("Octave Chat")
-        .inner_size(720.0, 800.0)
-        .min_inner_size(400.0, 480.0)
-        .build()
-        .map_err(|e| format!("{e}"))?;
-    Ok(())
-}
-
 pub fn run() {
     let actor = AppActorHandle::spawn().expect("failed to spawn audio actor thread");
     tauri::Builder::default()
@@ -482,7 +462,6 @@ pub fn run() {
             playback_status,
             recording_start,
             recording_stop,
-            open_chat_window,
             recording_status,
         ])
         .run(tauri::generate_context!())
