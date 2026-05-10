@@ -35,6 +35,28 @@ interface PlaybackStartResult {
   channels: number;
 }
 
+interface RecordingStartResult {
+  output_path: string;
+  sample_rate: number;
+  channels: number;
+}
+
+interface RecordedClip {
+  output_path: string;
+  sample_rate: number;
+  channels: number;
+  frame_count: number;
+  duration_seconds: number;
+  xrun_count: number;
+  peak_dbfs: number | null;
+}
+
+interface RecordingStatus {
+  state: string;
+  elapsed_seconds: number;
+  xrun_count: number;
+}
+
 /// Mirror of `PlaybackStatusResult` in app/src-tauri/src/lib.rs.
 /// `state` is the engine's `PlaybackState` Debug-formatted —
 /// "Playing", "Paused", "Stopped", "Ended", "Errored", "Closed".
@@ -119,6 +141,18 @@ export default function App() {
   const [showAllInputs, setShowAllInputs] = useState(false);
   const [selectedInputDeviceId, setSelectedInputDeviceId] = useState<string | null>(null);
 
+  // Recording session state. `recInfo` is the start-time snapshot
+  // (sample rate / channels / output path); `recStatus` is the live
+  // engine snapshot from the 200 ms polling tick. `recordedClip` is
+  // the final summary surfaced after Stop, with the auto-paste hook
+  // into the Play section.
+  const [recInfo, setRecInfo] = useState<RecordingStartResult | null>(null);
+  const [recStatus, setRecStatus] = useState<RecordingStatus | null>(null);
+  const [recordedClip, setRecordedClip] = useState<RecordedClip | null>(null);
+  const [recError, setRecError] = useState<string | null>(null);
+  const [recBusy, setRecBusy] = useState(false);
+  const recPollTimer = useRef<number | null>(null);
+
   async function handleListDevices() {
     setLoading(true);
     setError(null);
@@ -150,6 +184,44 @@ export default function App() {
       setInputs(null);
     } finally {
       setInputLoading(false);
+    }
+  }
+
+  async function handleRecord() {
+    if (!selectedInputDeviceId) return;
+    setRecBusy(true);
+    setRecError(null);
+    setRecordedClip(null);
+    try {
+      const result = await invoke<RecordingStartResult>("recording_start", {
+        deviceId: selectedInputDeviceId,
+      });
+      setRecInfo(result);
+      setRecStatus({ state: "Recording", elapsed_seconds: 0, xrun_count: 0 });
+    } catch (e) {
+      setRecError(String(e));
+      setRecInfo(null);
+    } finally {
+      setRecBusy(false);
+    }
+  }
+
+  async function handleStopRecording() {
+    setRecBusy(true);
+    setRecError(null);
+    try {
+      const clip = await invoke<RecordedClip>("recording_stop");
+      setRecInfo(null);
+      setRecStatus(null);
+      setRecordedClip(clip);
+      // Close the loop: the just-recorded WAV becomes the next thing
+      // the user can play. Pre-fills the Play row's path so a single
+      // click on Play sends the take to the selected output device.
+      setSourcePath(clip.output_path);
+    } catch (e) {
+      setRecError(String(e));
+    } finally {
+      setRecBusy(false);
     }
   }
 
@@ -287,6 +359,38 @@ export default function App() {
       }
     };
   }, [playInfo]);
+
+  // Symmetric polling for the recorder side — see playback's effect
+  // above for the contract. Returns-null teardown matches.
+  useEffect(() => {
+    if (!recInfo) {
+      if (recPollTimer.current !== null) {
+        window.clearInterval(recPollTimer.current);
+        recPollTimer.current = null;
+      }
+      return;
+    }
+    const tick = async () => {
+      try {
+        const snap = await invoke<RecordingStatus | null>("recording_status");
+        if (snap === null) {
+          setRecInfo(null);
+          setRecStatus(null);
+          return;
+        }
+        setRecStatus(snap);
+      } catch {
+        // Transient; ignore one tick.
+      }
+    };
+    recPollTimer.current = window.setInterval(tick, POLL_INTERVAL_MS);
+    return () => {
+      if (recPollTimer.current !== null) {
+        window.clearInterval(recPollTimer.current);
+        recPollTimer.current = null;
+      }
+    };
+  }, [recInfo]);
 
   const visible = useMemo(() => {
     if (!devices) return null;
@@ -549,6 +653,71 @@ export default function App() {
               </button>
             )}
           </>
+        )}
+
+        {selectedInputDeviceId && (
+          <div className="mt-6">
+            <div className="flex items-center gap-3">
+              {!recInfo ? (
+                <button
+                  type="button"
+                  onClick={handleRecord}
+                  disabled={recBusy}
+                  className="rounded-md bg-red-600 px-4 py-2 text-base font-medium text-white hover:bg-red-500 disabled:opacity-50 transition"
+                >
+                  {recBusy ? "Starting…" : "● Record"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleStopRecording}
+                  disabled={recBusy}
+                  className="rounded-md bg-elevated border border-red-500 px-4 py-2 text-base font-medium text-red-400 hover:bg-red-600 hover:text-white disabled:opacity-50 transition"
+                >
+                  {recBusy ? "Stopping…" : "■ Stop"}
+                </button>
+              )}
+              {recInfo && recStatus && (
+                <span className="font-mono tabular-nums text-fg">
+                  ● {formatTime(recStatus.elapsed_seconds)}
+                  {recStatus.xrun_count > 0 && (
+                    <span className="ml-3 text-yellow-400">
+                      xruns: {recStatus.xrun_count}
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+            {recInfo && (
+              <p className="mt-2 text-sm text-muted">
+                {recInfo.sample_rate} Hz · {recInfo.channels} ch → {recInfo.output_path}
+              </p>
+            )}
+            {recordedClip && (
+              <div className="mt-3 rounded-md bg-elevated border border-border px-4 py-3 text-sm">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-fg">
+                    Recorded {formatTime(recordedClip.duration_seconds)} ·{" "}
+                    {recordedClip.sample_rate} Hz · {recordedClip.channels} ch
+                  </span>
+                  {recordedClip.peak_dbfs !== null && (
+                    <span className="text-muted font-mono">
+                      peak {recordedClip.peak_dbfs.toFixed(1)} dBFS
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 text-muted font-mono text-xs truncate" title={recordedClip.output_path}>
+                  {recordedClip.output_path}
+                </div>
+                <div className="mt-2 text-xs text-accent">
+                  ↑ Auto-loaded into Play — pick an output device and hit Play.
+                </div>
+              </div>
+            )}
+            {recError && (
+              <pre className="mt-3 text-sm text-red-400 whitespace-pre-wrap">{recError}</pre>
+            )}
+          </div>
         )}
       </section>
     </main>

@@ -288,6 +288,157 @@ async fn playback_status(
     Ok(snapshot.map(Into::into))
 }
 
+/// Wire shape returned to the React side when recording starts.
+/// Includes the auto-generated output path so the UI can paste it
+/// straight into the Play section after Stop — closing the
+/// record-then-play loop without a save dialog.
+#[derive(Serialize)]
+struct RecordingStartResult {
+    output_path: String,
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// Wire shape for `recording_stop`. Mirrors `octave_recorder::RecordedClip`
+/// — the UI surfaces `output_path` (auto-pasted into Play) plus a
+/// summary line ("Recorded 4.32s · 48000 Hz · peak -3.2 dBFS").
+#[derive(Serialize)]
+struct RecordedClipResult {
+    output_path: String,
+    sample_rate: u32,
+    channels: u16,
+    frame_count: u64,
+    duration_seconds: f64,
+    xrun_count: u32,
+    /// Maximum peak across all channels in dBFS, or `null` if no
+    /// channels (recorder always returns at least one in practice).
+    peak_dbfs: Option<f32>,
+}
+
+impl From<octave_recorder::RecordedClip> for RecordedClipResult {
+    fn from(c: octave_recorder::RecordedClip) -> Self {
+        let peak_dbfs = c
+            .peak_dbfs
+            .iter()
+            .copied()
+            .fold(None, |acc, x| Some(acc.map_or(x, |a: f32| a.max(x))));
+        Self {
+            output_path: c.path.to_string_lossy().into_owned(),
+            sample_rate: c.sample_rate,
+            channels: c.channels,
+            frame_count: c.frame_count,
+            duration_seconds: c.duration_seconds,
+            xrun_count: c.xrun_count,
+            peak_dbfs,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RecordingStatusResult {
+    state: String,
+    elapsed_seconds: f64,
+    xrun_count: u32,
+}
+
+/// Auto-generate a take path under the user's tmp dir. Format:
+/// `octave-take-<unix-epoch-millis>.wav`. Sortable, collision-free,
+/// zero formatting deps. Less human-readable than YYYYMMDD-HHMMSS
+/// would be, but the user mostly identifies takes by their position
+/// in the file picker (most recent at the bottom). `tmp` is the right
+/// v0.1 default: auto-reclaimed on reboot, no clutter; move to a
+/// permanent location later via the OS file manager.
+fn generated_take_path() -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("octave-take-{millis}.wav"))
+}
+
+#[tauri::command]
+async fn recording_start(
+    actor: tauri::State<'_, AppActorHandle>,
+    device_id: String,
+) -> Result<RecordingStartResult, String> {
+    use octave_recorder::{BufferSize, DeviceId, RecordingSpec};
+
+    // Probe capabilities to pick a working (sample_rate, channels) the
+    // device actually supports. Mirror of the recorder's record-demo
+    // logic — prefer 48 kHz stereo, fall back to whatever the device
+    // reports.
+    let id = DeviceId(device_id);
+    let caps = actor
+        .recorder_catalog()
+        .device_capabilities(&id)
+        .map_err(|e| format!("device_capabilities: {e}"))?;
+    let sample_rate = if caps.supported_sample_rates.contains(&48_000) {
+        48_000
+    } else {
+        caps.default_sample_rate
+    };
+    let channels: u16 = if caps.channels.contains(&2) { 2 } else { 1 };
+
+    let output_path = generated_take_path();
+    let spec = RecordingSpec {
+        device_id: id,
+        sample_rate,
+        buffer_size: BufferSize::Default,
+        channels,
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::StartRecording {
+            spec,
+            output_path,
+            reply: reply_tx,
+        })
+        .map_err(|e| format!("{e}"))?;
+    let result = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?
+        .map_err(|e| format!("{e}"))?;
+    Ok(RecordingStartResult {
+        output_path: result.output_path.to_string_lossy().into_owned(),
+        sample_rate: result.sample_rate,
+        channels: result.channels,
+    })
+}
+
+#[tauri::command]
+async fn recording_stop(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<RecordedClipResult, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::StopRecording { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let clip = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?
+        .map_err(|e| format!("{e}"))?;
+    Ok(clip.into())
+}
+
+#[tauri::command]
+async fn recording_status(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<Option<RecordingStatusResult>, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::RecordingStatus { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let snapshot = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?;
+    Ok(snapshot.map(|s| RecordingStatusResult {
+        state: s.state,
+        elapsed_seconds: s.elapsed_seconds,
+        xrun_count: s.xrun_count,
+    }))
+}
+
 pub fn run() {
     let actor = AppActorHandle::spawn().expect("failed to spawn audio actor thread");
     tauri::Builder::default()
@@ -301,6 +452,9 @@ pub fn run() {
             playback_resume,
             playback_stop,
             playback_status,
+            recording_start,
+            recording_stop,
+            recording_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running octave-app");
