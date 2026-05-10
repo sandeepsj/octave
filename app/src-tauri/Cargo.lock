@@ -2270,11 +2270,14 @@ dependencies = [
 name = "octave-app"
 version = "0.0.1"
 dependencies = [
+ "crossbeam-channel",
  "octave-player",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

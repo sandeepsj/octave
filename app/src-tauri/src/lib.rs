@@ -1,14 +1,23 @@
 //! Tauri shell — wires `octave_player` into the React UI via
 //! `#[tauri::command]` handlers.
 //!
-//! v0.1 surface: one command, `list_output_devices`, mirroring the
-//! recorder's MCP tool surface (the agent calls `playback_list_output_devices`
-//! over stdio; the UI calls this over Tauri IPC). Same engine
-//! function, two facades — per the project architecture memory.
+//! Engine surface mirrored to the UI (and, separately, to the agent
+//! via `octave-mcp`):
+//!
+//! - `list_output_devices` — enumerate output devices.
+//! - `playback_start` / `playback_stop` — open a WAV file and play it
+//!   through a chosen device; stop it. Backed by [`app_actor`] because
+//!   `cpal::Stream` is `!Send` and `tauri::State` requires `Send + Sync`.
+
+mod app_actor;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::Serialize;
+use tokio::sync::oneshot;
+
+use app_actor::{AppActorHandle, Command};
 
 /// Wire shape returned to the React side. Mirrors
 /// [`octave_player::OutputDeviceInfo`] but flattens the `DeviceId`
@@ -108,9 +117,89 @@ fn alsa_friendly_name(name: &str, cards: &HashMap<String, String>) -> Option<Str
     cards.get(card).cloned()
 }
 
+/// Wire shape for `playback_start` — what we hand the React side
+/// after the engine has accepted the open + the audio stream is live.
+/// `duration_seconds` is `None` for endless sources (in v0.1 only the
+/// `Buffer` source variant is endless; `File` always reports a
+/// duration).
+#[derive(Serialize)]
+struct PlaybackStartResult {
+    duration_seconds: Option<f64>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// Wire shape for `playback_stop` — final position the audio thread
+/// reached, plus the engine state name (`"Stopped"`, `"Ended"`, etc.).
+#[derive(Serialize)]
+struct PlaybackStopResult {
+    state: String,
+    position_seconds: f64,
+}
+
+#[tauri::command]
+async fn playback_start(
+    actor: tauri::State<'_, AppActorHandle>,
+    device_id: String,
+    source_path: String,
+) -> Result<PlaybackStartResult, String> {
+    use octave_player::{BufferSize, DeviceId, PlaybackSourceSpec, PlaybackSpec};
+
+    let spec = PlaybackSpec {
+        device_id: DeviceId(device_id),
+        source: PlaybackSourceSpec::File {
+            path: PathBuf::from(source_path),
+        },
+        // The engine picks a sensible buffer for the device — UI doesn't
+        // expose tuning yet; agents can dial it via the MCP surface.
+        buffer_size: BufferSize::Default,
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::Start {
+            spec,
+            reply: reply_tx,
+        })
+        .map_err(|e| format!("{e}"))?;
+    let result = reply_rx.await.map_err(|_| "audio thread dropped reply".to_string())?;
+    let r = result.map_err(|e| format!("{e}"))?;
+    Ok(PlaybackStartResult {
+        duration_seconds: r.duration_seconds,
+        sample_rate: r.sample_rate,
+        channels: r.channels,
+    })
+}
+
+#[tauri::command]
+async fn playback_stop(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<PlaybackStopResult, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::Stop { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let status = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?
+        .map_err(|e| format!("{e}"))?;
+    Ok(PlaybackStopResult {
+        // Debug-format the enum — same convention as `backend` in
+        // `OutputDeviceInfo`. Pattern-matchable on the JS side.
+        state: format!("{:?}", status.state),
+        position_seconds: status.position_seconds,
+    })
+}
+
 pub fn run() {
+    let actor = AppActorHandle::spawn().expect("failed to spawn audio actor thread");
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![list_output_devices])
+        .manage(actor)
+        .invoke_handler(tauri::generate_handler![
+            list_output_devices,
+            playback_start,
+            playback_stop,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running octave-app");
 }
