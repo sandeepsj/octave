@@ -146,6 +146,10 @@ To make every device that ever appeared in a listing reusable for `start`, both 
 
 Side-effect: since we hold the PCM open, the device is exclusively ours from the moment the catalog lists it until the catalog is dropped (or replaced by another `list_output_devices` call that doesn't include it). For a DAW this is the correct semantic — Bitwig / Reaper / Pro Tools all grab the audio interface exclusively.
 
+**Re-list flushes the cache before probing.** A naïve "build new cache, swap in" would keep the old `cpal::Device` handles alive *during* the new enumeration — and those old handles would then block cpal's `snd_pcm_open` probe of the same hw: PCMs, silently dropping them from the listing. So `list_output_devices` clears the cache up front, before the first probe. Active `PlaybackHandle`s carry their own Arc-shared clone of `cpal::Device`, so this clear doesn't disturb them — the underlying ALSA PCM stays open as long as any live handle still references it (the cache being one possible reference among many).
+
+**Multi-pass enumeration.** A single `host.output_devices()` pass can miss a hw: PCM that PipeWire holds at the exact probe moment. The catalog runs `ENUMERATION_PASSES = 3` passes with `ENUMERATION_PASS_GAP = 100 ms` between them, unioning by id and keeping the first-seen `cpal::Device` for each unique device. 3 × 100 ms = 300 ms list latency, below the 400 ms ISO-acceptable threshold for "instant" feedback on a button click.
+
 Cross-platform: `cpal::Device` is `Send + Sync` on every backend Octave targets (ALSA via `Arc<Mutex<…>>`; CoreAudio is POD; WASAPI declares it explicitly). The catalog is therefore safe to share across threads behind its internal `Mutex<HashMap<DeviceId, cpal::Device>>`.
 
 ### 3.4 Engine layer — RT side

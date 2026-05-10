@@ -15,8 +15,24 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
+
+/// Multi-pass enumeration tunables. cpal's ALSA backend probes each
+/// PCM hint by calling `snd_pcm_open(name, …, SND_PCM_NONBLOCK)` and
+/// silently dropping devices whose open returns `EBUSY`. PipeWire
+/// holds physical `hw:CARD=` PCMs exclusively at arbitrary moments
+/// (its scheduler grabs and releases as the user's audio graph
+/// changes), so any single enumeration pass can miss a device that's
+/// physically present and would otherwise be openable. Three passes
+/// with 100 ms gaps catches most of this race; the union-by-id keeps
+/// the `cpal::Device` from whichever pass first saw each device.
+///
+/// 3 × 100 ms = 300 ms total list latency. Acceptable for a button
+/// click; below the 400 ms ISO-acceptable threshold for "instant".
+const ENUMERATION_PASSES: u32 = 3;
+const ENUMERATION_PASS_GAP: Duration = Duration::from_millis(100);
 use thiserror::Error;
 
 use crate::types::{Backend, DeviceId, OutputCapabilities, OutputDeviceInfo};
@@ -59,7 +75,29 @@ impl DeviceCatalog {
     /// handles; entries that disappeared since the previous call are
     /// dropped (releasing their underlying ALSA refs). Subsequent
     /// `start()` calls will use these cached handles.
+    ///
+    /// Multi-pass: see [`ENUMERATION_PASSES`] / [`ENUMERATION_PASS_GAP`]
+    /// — single-pass enumeration loses to PipeWire's intermittent
+    /// exclusive-grab on Linux. Each pass is a fresh
+    /// `host.output_devices()` iteration; the union keeps every
+    /// device id any pass saw, with the `cpal::Device` from the first
+    /// pass that found it.
     pub fn list_output_devices(&self) -> Vec<OutputDeviceInfo> {
+        // Drop the old cache UP FRONT — before the new enumeration —
+        // so our own cached `cpal::Device` handles release their
+        // underlying ALSA PCM refs before the multi-pass probe tries
+        // to open those same devices. Without this, a re-list call
+        // sees previously-listed hw: devices as "busy" because we
+        // ourselves still hold them open from the previous list.
+        // Active `PlaybackHandle`s carry their own Arc-shared clone
+        // of the cpal::Device, so this clear doesn't disturb them —
+        // the underlying ALSA PCM stays open as long as any live
+        // handle references it.
+        {
+            let mut guard = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clear();
+        }
+
         let mut out = Vec::new();
         let mut new_cache: HashMap<DeviceId, cpal::Device> = HashMap::new();
         for host_id in cpal::available_hosts() {
@@ -68,24 +106,38 @@ impl DeviceCatalog {
             let default_name = host
                 .default_output_device()
                 .and_then(|d| d.name().ok());
-            let Ok(devices) = host.output_devices() else { continue };
-            for device in devices {
-                let Ok(name) = device.name() else { continue };
-                let max_output_channels = device
-                    .supported_output_configs()
-                    .ok()
-                    .and_then(|iter| iter.map(|c| c.channels()).max())
-                    .unwrap_or(0);
-                let id = DeviceId(encode_id(host_id, &name));
-                let is_default_output = default_name.as_deref() == Some(name.as_str());
-                new_cache.insert(id.clone(), device);
-                out.push(OutputDeviceInfo {
-                    id,
-                    name,
-                    backend,
-                    is_default_output,
-                    max_output_channels,
-                });
+            for pass in 0..ENUMERATION_PASSES {
+                if pass > 0 {
+                    // Sleep BEFORE the next pass so the first pass is
+                    // unaffected. Gives PipeWire a window to release any
+                    // hw: PCM that was briefly held.
+                    std::thread::sleep(ENUMERATION_PASS_GAP);
+                }
+                let Ok(devices) = host.output_devices() else { continue };
+                for device in devices {
+                    let Ok(name) = device.name() else { continue };
+                    let id = DeviceId(encode_id(host_id, &name));
+                    // Union by id: a device we already collected on a
+                    // previous pass keeps its first-seen `cpal::Device`
+                    // handle. New devices get appended in pass order.
+                    if new_cache.contains_key(&id) {
+                        continue;
+                    }
+                    let max_output_channels = device
+                        .supported_output_configs()
+                        .ok()
+                        .and_then(|iter| iter.map(|c| c.channels()).max())
+                        .unwrap_or(0);
+                    let is_default_output = default_name.as_deref() == Some(name.as_str());
+                    new_cache.insert(id.clone(), device);
+                    out.push(OutputDeviceInfo {
+                        id,
+                        name,
+                        backend,
+                        is_default_output,
+                        max_output_channels,
+                    });
+                }
             }
         }
         // Mutex poisoning here would mean a previous holder panicked

@@ -168,6 +168,8 @@ $$
 
 Each integer path's closure owns a pre-allocated `Vec<f32>` scratch (sized at stream-build time, capped at `MAX_SCRATCH_FRAMES = 16384` frames per channel). Per callback: convert `&[T]` → scratch slice, then call `process_input_buffer(scratch_slice, …)`. No allocation, no syscall, no lock — RT-safe. If cpal ever hands a buffer larger than the scratch, the callback drops the buffer (treated as an xrun) rather than allocating in the RT path.
 
+**Re-list flushes the cache before probing**, and **multi-pass enumeration** (3 × 100 ms) — both mirror the playback side; see [`playback-audio` §3.3.1](./playback-audio.md#331-device-handle-caching--devicecatalog) for the rationale. Without the cache clear, our own previously-cached `cpal::Device` handles would block cpal's `snd_pcm_open` probe of the same hw: PCMs on a re-list. Without multi-pass, a single probe can lose to PipeWire's intermittent exclusive-grab.
+
 > [!WARNING]
 > cpal's API is mostly stable but the `BufferSize` request is a *hint* on some backends (Core Audio, WASAPI shared mode). The plan budgets for the requested buffer size but verifies the actual size from the first callback's slice length.
 

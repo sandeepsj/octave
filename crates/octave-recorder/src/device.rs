@@ -9,8 +9,23 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
+
+/// Multi-pass enumeration tunables (mirror of `octave-player`'s
+/// constants). cpal's ALSA backend probes each PCM hint with
+/// `snd_pcm_open(name, …, SND_PCM_NONBLOCK)` and silently drops
+/// devices whose open returns `EBUSY`. PipeWire holds physical
+/// `hw:CARD=` capture PCMs exclusively at arbitrary moments, so any
+/// single pass can miss a device. Three passes with 100 ms gaps
+/// catches most of the race; the union-by-id keeps the `cpal::Device`
+/// from whichever pass first saw each device.
+///
+/// 3 × 100 ms = 300 ms total list latency. Acceptable for a button
+/// click; below the 400 ms ISO-acceptable threshold for "instant".
+const ENUMERATION_PASSES: u32 = 3;
+const ENUMERATION_PASS_GAP: Duration = Duration::from_millis(100);
 
 use crate::{Backend, Capabilities, DeviceId, DeviceInfo, OpenError};
 
@@ -46,7 +61,25 @@ impl DeviceCatalog {
     /// **skipped** (with a `tracing::warn`) rather than being surfaced
     /// with `max_input_channels = 0` — the latter looks like a broken
     /// device to UI/agents and hides the underlying probe failure.
+    ///
+    /// Multi-pass: see [`ENUMERATION_PASSES`] / [`ENUMERATION_PASS_GAP`]
+    /// — single-pass enumeration loses to PipeWire's intermittent
+    /// exclusive-grab on Linux. Each pass is a fresh
+    /// `host.input_devices()` iteration; the union keeps every device
+    /// id any pass saw, with the `cpal::Device` from the first pass
+    /// that found it.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
+        // Drop the old cache UP FRONT — see the symmetric comment in
+        // `octave-player::DeviceCatalog::list_output_devices`. Our own
+        // cached `cpal::Device` handles would otherwise block the
+        // multi-pass probe of those same devices on a re-list. Active
+        // `RecordingHandle`s carry their own Arc-shared clone, so
+        // this clear doesn't disturb them.
+        {
+            let mut guard = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clear();
+        }
+
         let mut out = Vec::new();
         let mut new_cache: HashMap<DeviceId, cpal::Device> = HashMap::new();
         for host_id in cpal::available_hosts() {
@@ -55,33 +88,43 @@ impl DeviceCatalog {
             let default_name = host
                 .default_input_device()
                 .and_then(|d| d.name().ok());
-            let Ok(devices) = host.input_devices() else { continue };
-            for device in devices {
-                let Ok(name) = device.name() else { continue };
-                let max_input_channels = match device.supported_input_configs() {
-                    Ok(iter) => iter.map(|c| c.channels()).max().unwrap_or(0),
-                    Err(e) => {
-                        tracing::warn!(
-                            device = %name,
-                            error = %e,
-                            "supported_input_configs failed; skipping device"
-                        );
+            for pass in 0..ENUMERATION_PASSES {
+                if pass > 0 {
+                    std::thread::sleep(ENUMERATION_PASS_GAP);
+                }
+                let Ok(devices) = host.input_devices() else { continue };
+                for device in devices {
+                    let Ok(name) = device.name() else { continue };
+                    let id = DeviceId(encode_id(host_id, &name));
+                    // Union by id: keep the first pass's cpal::Device
+                    // and skip duplicates on later passes.
+                    if new_cache.contains_key(&id) {
                         continue;
                     }
-                };
-                let id = DeviceId(encode_id(host_id, &name));
-                let is_default_input = default_name.as_deref() == Some(name.as_str());
-                new_cache.insert(id.clone(), device);
-                out.push(DeviceInfo {
-                    id,
-                    name,
-                    backend: backend.clone(),
-                    is_default_input,
-                    // Class-compliant USB detection requires udev / IOKit / WinUSB
-                    // queries that are out of scope for v0.1.
-                    is_class_compliant_usb: false,
-                    max_input_channels,
-                });
+                    let max_input_channels = match device.supported_input_configs() {
+                        Ok(iter) => iter.map(|c| c.channels()).max().unwrap_or(0),
+                        Err(e) => {
+                            tracing::warn!(
+                                device = %name,
+                                error = %e,
+                                "supported_input_configs failed; skipping device"
+                            );
+                            continue;
+                        }
+                    };
+                    let is_default_input = default_name.as_deref() == Some(name.as_str());
+                    new_cache.insert(id.clone(), device);
+                    out.push(DeviceInfo {
+                        id,
+                        name,
+                        backend: backend.clone(),
+                        is_default_input,
+                        // Class-compliant USB detection requires udev / IOKit / WinUSB
+                        // queries that are out of scope for v0.1.
+                        is_class_compliant_usb: false,
+                        max_input_channels,
+                    });
+                }
             }
         }
         // Mutex poisoning here would mean a previous holder panicked
