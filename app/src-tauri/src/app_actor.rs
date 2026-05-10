@@ -103,8 +103,20 @@ pub enum Command {
         spec: PlaybackSpec,
         reply: oneshot::Sender<Result<PlaybackStartReply, PlaybackStartError>>,
     },
+    Pause {
+        reply: oneshot::Sender<Result<PlaybackStatus, PlaybackTransportError>>,
+    },
+    Resume {
+        reply: oneshot::Sender<Result<PlaybackStatus, PlaybackTransportError>>,
+    },
     Stop {
         reply: oneshot::Sender<Result<PlaybackStatus, PlaybackStopError>>,
+    },
+    /// Cheap status snapshot — UI polls this while playing to update
+    /// the position display and to notice natural EOF (engine
+    /// transitions to `Ended` without us asking).
+    Status {
+        reply: oneshot::Sender<Option<PlaybackStatus>>,
     },
 }
 
@@ -131,6 +143,14 @@ pub enum PlaybackStopError {
     Stop(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PlaybackTransportError {
+    #[error("nothing is currently playing")]
+    NotPlaying,
+    #[error("TransportError::{0}")]
+    Transport(String),
+}
+
 fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
     let mut active: Option<PlaybackHandle> = None;
     while let Ok(cmd) = rx.recv() {
@@ -155,6 +175,26 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
                     }
                 }
             }
+            Command::Pause { reply } => {
+                let result = match active.as_mut() {
+                    None => Err(PlaybackTransportError::NotPlaying),
+                    Some(handle) => match handle.pause() {
+                        Ok(()) => Ok(handle.status()),
+                        Err(e) => Err(PlaybackTransportError::Transport(format!("{e}"))),
+                    },
+                };
+                let _ = reply.send(result);
+            }
+            Command::Resume { reply } => {
+                let result = match active.as_mut() {
+                    None => Err(PlaybackTransportError::NotPlaying),
+                    Some(handle) => match handle.resume() {
+                        Ok(()) => Ok(handle.status()),
+                        Err(e) => Err(PlaybackTransportError::Transport(format!("{e}"))),
+                    },
+                };
+                let _ = reply.send(result);
+            }
             Command::Stop { reply } => {
                 let result = match active.take() {
                     None => Err(PlaybackStopError::NotPlaying),
@@ -174,6 +214,10 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
                     },
                 };
                 let _ = reply.send(result);
+            }
+            Command::Status { reply } => {
+                let snapshot = active.as_ref().map(|h| h.status());
+                let _ = reply.send(snapshot);
             }
         }
     }

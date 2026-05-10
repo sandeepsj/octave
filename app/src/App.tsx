@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -22,10 +22,24 @@ interface PlaybackStartResult {
   channels: number;
 }
 
-interface PlaybackStopResult {
+/// Mirror of `PlaybackStatusResult` in app/src-tauri/src/lib.rs.
+/// `state` is the engine's `PlaybackState` Debug-formatted —
+/// "Playing", "Paused", "Stopped", "Ended", "Errored", "Closed".
+interface PlaybackStatus {
   state: string;
   position_seconds: number;
+  duration_seconds: number | null;
 }
+
+/// Format seconds as "M:SS". Negative / NaN → "0:00".
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+const POLL_INTERVAL_MS = 200;
 
 /// Linux ALSA exposes ~15 PCM names per card (raw `hw:`, format-
 /// converting `plughw:`, software mixer `dmix:`, channel-map
@@ -69,16 +83,19 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [showAll, setShowAll] = useState(false);
 
-  // Playback affordance state. We don't poll the engine for state
-  // changes (the file may end on its own without us hearing about it);
-  // the UI tracks "what we last asked for". A natural-end means Play
-  // again will succeed; the AlreadyPlaying guard catches the case
-  // where the stream is still live.
+  // Playback affordance state. `playInfo` is the start-time snapshot
+  // (sample rate / channels / total duration); `playStatus` is the
+  // live snapshot from the engine, refreshed on a 200 ms tick while
+  // a session is active. We need both: playInfo carries the duration
+  // (status sometimes loses it on terminal states), playStatus carries
+  // the live position + state for the buttons.
   const [sourcePath, setSourcePath] = useState("");
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
   const [playInfo, setPlayInfo] = useState<PlaybackStartResult | null>(null);
+  const [playStatus, setPlayStatus] = useState<PlaybackStatus | null>(null);
   const [playError, setPlayError] = useState<string | null>(null);
   const [playBusy, setPlayBusy] = useState(false);
+  const pollTimer = useRef<number | null>(null);
 
   async function handleListDevices() {
     setLoading(true);
@@ -135,9 +152,42 @@ export default function App() {
         sourcePath: sourcePath.trim(),
       });
       setPlayInfo(result);
+      // Seed status from the start-time snapshot so the UI doesn't
+      // flash "0:00 / —" before the first poll fires.
+      setPlayStatus({
+        state: "Playing",
+        position_seconds: 0,
+        duration_seconds: result.duration_seconds,
+      });
     } catch (e) {
       setPlayError(String(e));
       setPlayInfo(null);
+    } finally {
+      setPlayBusy(false);
+    }
+  }
+
+  async function handlePause() {
+    setPlayBusy(true);
+    setPlayError(null);
+    try {
+      const status = await invoke<PlaybackStatus>("playback_pause");
+      setPlayStatus(status);
+    } catch (e) {
+      setPlayError(String(e));
+    } finally {
+      setPlayBusy(false);
+    }
+  }
+
+  async function handleResume() {
+    setPlayBusy(true);
+    setPlayError(null);
+    try {
+      const status = await invoke<PlaybackStatus>("playback_resume");
+      setPlayStatus(status);
+    } catch (e) {
+      setPlayError(String(e));
     } finally {
       setPlayBusy(false);
     }
@@ -147,17 +197,58 @@ export default function App() {
     setPlayBusy(true);
     setPlayError(null);
     try {
-      const result = await invoke<PlaybackStopResult>("playback_stop");
+      const result = await invoke<PlaybackStatus>("playback_stop");
       setPlayInfo(null);
+      setPlayStatus(null);
       // Surface where playback actually stopped (useful if the user
       // hit Stop before the file ended).
-      setPlayError(`Stopped at ${result.position_seconds.toFixed(2)}s (${result.state})`);
+      setPlayError(`Stopped at ${formatTime(result.position_seconds)} (${result.state})`);
     } catch (e) {
       setPlayError(String(e));
     } finally {
       setPlayBusy(false);
     }
   }
+
+  // Poll the engine while a session is active. The actor returns
+  // `None` once the handle is gone (after Stop, or after a future
+  // auto-cleanup on engine error) — that's our cue to tear the timer
+  // down. Natural EOF doesn't drop the handle (engine moves to
+  // `Ended`); the UI surfaces the Ended state and lets the user hit
+  // Stop to reclaim the slot.
+  useEffect(() => {
+    if (!playInfo) {
+      if (pollTimer.current !== null) {
+        window.clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+      return;
+    }
+    const tick = async () => {
+      try {
+        const snap = await invoke<PlaybackStatus | null>("playback_status");
+        if (snap === null) {
+          // Actor lost the handle (e.g., engine errored). Reflect that
+          // in the UI by clearing playInfo, which trips this effect's
+          // teardown branch on the next render.
+          setPlayInfo(null);
+          setPlayStatus(null);
+          return;
+        }
+        setPlayStatus(snap);
+      } catch {
+        // Transient channel hiccup — ignore one tick; if it persists,
+        // the user can hit Stop manually.
+      }
+    };
+    pollTimer.current = window.setInterval(tick, POLL_INTERVAL_MS);
+    return () => {
+      if (pollTimer.current !== null) {
+        window.clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    };
+  }, [playInfo]);
 
   const visible = useMemo(() => {
     if (!devices) return null;
@@ -166,6 +257,8 @@ export default function App() {
 
   const hiddenCount = devices && visible ? devices.length - visible.length : 0;
   const canPlay = !playBusy && !playInfo && !!selectedDeviceId && !!sourcePath.trim();
+  const isPaused = playStatus?.state === "Paused";
+  const isEnded = playStatus?.state === "Ended";
 
   return (
     <main className="min-h-screen p-8 max-w-2xl mx-auto">
@@ -278,23 +371,56 @@ export default function App() {
                 {playBusy ? "Starting…" : "Play"}
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={handleStop}
-                disabled={playBusy}
-                className="rounded-md bg-elevated border border-accent px-4 py-2 text-base font-medium text-accent hover:bg-accent hover:text-black disabled:opacity-50 transition"
-              >
-                {playBusy ? "Stopping…" : "Stop"}
-              </button>
+              <>
+                {/* Pause/Resume hidden once the engine reports `Ended`
+                    — natural EOF means the audio thread is done; only
+                    Stop is meaningful from there (it releases the
+                    session slot so Play can re-arm). */}
+                {!isEnded &&
+                  (isPaused ? (
+                    <button
+                      type="button"
+                      onClick={handleResume}
+                      disabled={playBusy}
+                      className="rounded-md bg-elevated border border-accent px-4 py-2 text-base font-medium text-accent hover:bg-accent hover:text-black disabled:opacity-50 transition"
+                    >
+                      {playBusy ? "Resuming…" : "Resume"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handlePause}
+                      disabled={playBusy}
+                      className="rounded-md bg-elevated border border-border px-4 py-2 text-base font-medium hover:border-muted disabled:opacity-50 transition"
+                    >
+                      {playBusy ? "Pausing…" : "Pause"}
+                    </button>
+                  ))}
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  disabled={playBusy}
+                  className="rounded-md bg-elevated border border-accent px-4 py-2 text-base font-medium text-accent hover:bg-accent hover:text-black disabled:opacity-50 transition"
+                >
+                  {playBusy ? "Stopping…" : "Stop"}
+                </button>
+              </>
             )}
           </div>
 
-          {playInfo && (
-            <p className="mt-3 text-sm text-muted">
-              Playing — {playInfo.sample_rate} Hz · {playInfo.channels} ch
-              {playInfo.duration_seconds !== null &&
-                ` · ${playInfo.duration_seconds.toFixed(2)}s`}
-            </p>
+          {playInfo && playStatus && (
+            <div className="mt-3 flex items-center justify-between text-sm">
+              <span className="text-muted">
+                {playStatus.state} — {playInfo.sample_rate} Hz · {playInfo.channels} ch
+              </span>
+              <span className="font-mono tabular-nums text-fg">
+                {formatTime(playStatus.position_seconds)}
+                {" / "}
+                {playInfo.duration_seconds !== null
+                  ? formatTime(playInfo.duration_seconds)
+                  : "—:—"}
+              </span>
+            </div>
           )}
           {playError && (
             <pre className="mt-3 text-sm text-red-400 whitespace-pre-wrap">{playError}</pre>

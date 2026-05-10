@@ -131,12 +131,31 @@ struct PlaybackStartResult {
     channels: u16,
 }
 
-/// Wire shape for `playback_stop` — final position the audio thread
-/// reached, plus the engine state name (`"Stopped"`, `"Ended"`, etc.).
+/// Wire shape for `playback_stop` / `playback_pause` / `playback_resume`
+/// / `playback_status` — engine state name (`"Playing"`, `"Paused"`,
+/// `"Stopped"`, `"Ended"`, etc.) plus the live position. UI uses these
+/// to drive the Pause/Resume/Stop button states and the position
+/// display ("0:42 / 1:30").
+///
+/// `duration_seconds` is `None` for endless sources and for the
+/// post-stop snapshot when the engine no longer holds a duration.
 #[derive(Serialize)]
-struct PlaybackStopResult {
+struct PlaybackStatusResult {
     state: String,
     position_seconds: f64,
+    duration_seconds: Option<f64>,
+}
+
+impl From<octave_player::PlaybackStatus> for PlaybackStatusResult {
+    fn from(s: octave_player::PlaybackStatus) -> Self {
+        Self {
+            // Debug-format the enum — same convention as `backend` in
+            // `OutputDeviceInfo`. Pattern-matchable on the JS side.
+            state: format!("{:?}", s.state),
+            position_seconds: s.position_seconds,
+            duration_seconds: s.duration_seconds,
+        }
+    }
 }
 
 #[tauri::command]
@@ -174,9 +193,39 @@ async fn playback_start(
 }
 
 #[tauri::command]
+async fn playback_pause(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<PlaybackStatusResult, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::Pause { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let status = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?
+        .map_err(|e| format!("{e}"))?;
+    Ok(status.into())
+}
+
+#[tauri::command]
+async fn playback_resume(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<PlaybackStatusResult, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::Resume { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let status = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?
+        .map_err(|e| format!("{e}"))?;
+    Ok(status.into())
+}
+
+#[tauri::command]
 async fn playback_stop(
     actor: tauri::State<'_, AppActorHandle>,
-) -> Result<PlaybackStopResult, String> {
+) -> Result<PlaybackStatusResult, String> {
     let (reply_tx, reply_rx) = oneshot::channel();
     actor
         .send(Command::Stop { reply: reply_tx })
@@ -185,12 +234,23 @@ async fn playback_stop(
         .await
         .map_err(|_| "audio thread dropped reply".to_string())?
         .map_err(|e| format!("{e}"))?;
-    Ok(PlaybackStopResult {
-        // Debug-format the enum — same convention as `backend` in
-        // `OutputDeviceInfo`. Pattern-matchable on the JS side.
-        state: format!("{:?}", status.state),
-        position_seconds: status.position_seconds,
-    })
+    Ok(status.into())
+}
+
+/// Cheap snapshot. Returns `None` when nothing is playing — the UI
+/// uses that to clean up its polling tick + button state.
+#[tauri::command]
+async fn playback_status(
+    actor: tauri::State<'_, AppActorHandle>,
+) -> Result<Option<PlaybackStatusResult>, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor
+        .send(Command::Status { reply: reply_tx })
+        .map_err(|e| format!("{e}"))?;
+    let snapshot = reply_rx
+        .await
+        .map_err(|_| "audio thread dropped reply".to_string())?;
+    Ok(snapshot.map(Into::into))
 }
 
 pub fn run() {
@@ -201,7 +261,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_output_devices,
             playback_start,
+            playback_pause,
+            playback_resume,
             playback_stop,
+            playback_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running octave-app");
