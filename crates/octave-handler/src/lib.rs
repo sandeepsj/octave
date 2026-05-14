@@ -20,6 +20,7 @@
 
 mod engine_client;
 mod server;
+mod state;
 
 use thiserror::Error;
 
