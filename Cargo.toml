@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/octave-audio-devices",
     "crates/octave-engine",
+    "crates/octave-handler",
     "crates/octave-player",
     "crates/octave-recorder",
 ]

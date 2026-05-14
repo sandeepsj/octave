@@ -1,0 +1,36 @@
+[package]
+name        = "octave-handler"
+version     = "0.1.0"
+description = "Octave's intent + state layer. Speaks MCP server (north, to frontends) and MCP client (south, to a child octave-engine). Phase 2a is plumbing-only; phase 2b adds AppState + validation; phase 2c adds push notifications. See docs/modules/system-architecture.md."
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+
+[dependencies]
+# rmcp's `client` feature gives us ServiceExt::serve as an MCP client
+# (the child octave-engine is the server we connect to). `server` +
+# `macros` gives us the #[tool_router] for our own north-side surface.
+# `transport-io` covers our own stdio listener; `transport-child-process`
+# covers TokioChildProcess for spawning the engine. `schemars` derives
+# JSON Schema for our tool args.
+rmcp = { version = "1.5", features = ["server", "client", "macros", "transport-io", "transport-child-process", "schemars"] }
+tokio              = { workspace = true }
+tokio-util         = { version = "0.7" }
+schemars           = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+
+[[bin]]
+name = "octave-handler"
+path = "src/bin/octave-handler.rs"
+
+[lints]
+workspace = true
