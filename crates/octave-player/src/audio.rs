@@ -154,7 +154,7 @@ struct Internals {
 /// Process-global single-session enforcer. Plan §3.7 / §13.3 require
 /// at most one active playback session at a time, with a check at
 /// both the engine and actor layers (defence in depth). The actor
-/// layer's check lives in `octave-mcp::audio_actor`; this is the
+/// layer's check lives in `octave-engine::audio_actor`; this is the
 /// engine-layer counterpart.
 fn session_lock() -> &'static Mutex<Option<Uuid>> {
     static LOCK: OnceLock<Mutex<Option<Uuid>>> = OnceLock::new();

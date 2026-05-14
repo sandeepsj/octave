@@ -1,16 +1,16 @@
 /**
  * Octave Chat — standalone CLI.
  *
- * Connects to the `octave-mcp` server and lets you drive Octave's
+ * Connects to the `octave-engine` server and lets you drive Octave's
  * audio engine through Claude Haiku 4.5 via the Vercel AI SDK.
  *
  * Transport selection (env `OCTAVE_MCP`):
- *   stdio (default)  — spawn `cargo run -q -p octave-mcp` from the
+ *   stdio (default)  — spawn `cargo run -q -p octave-engine` from the
  *                      sibling repo and pipe stdio to the MCP client.
  *                      Works for local dev; needs no network setup.
  *   <url>            — connect via SSE over HTTP to a running
- *                      octave-mcp instance (LAN-accessible). HTTP
- *                      transport on octave-mcp is the next cycle step;
+ *                      octave-engine instance (LAN-accessible). HTTP
+ *                      transport on octave-engine is the next cycle step;
  *                      this branch is wired so the swap is one env
  *                      var, not a code change.
  *
@@ -41,12 +41,12 @@ if (!ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
-const SYSTEM_PROMPT = `You are Octave's CLI assistant. You have tools to enumerate audio devices and to record / play audio on the user's machine through the octave-mcp server.
+const SYSTEM_PROMPT = `You are Octave's CLI assistant. You have tools to enumerate audio devices and to record / play audio on the user's machine through the octave-engine server.
 
 Defaults the user expects:
 - Recording defaults to mono unless they explicitly ask for stereo (their interface is typically a single-mic Focusrite Solo).
 - On Linux, the device id "ALSA:default" routes through the system audio (PipeWire) — safe pick when the user doesn't name a specific device.
-- After recording_stop returns the WAV path, feed that path straight into playback_start to play the take back.
+- After input_stop returns the WAV path, feed that path straight into output_start to play the take back.
 
 Be concise. Confirm what you did with one short sentence. Don't explain tool calls unless asked.`;
 
@@ -60,16 +60,16 @@ function buildTransport(): { transport: Transport; describe: string } {
       describe: `SSE → ${url}`,
     };
   }
-  // stdio: spawn `cargo run -q -p octave-mcp` from the repo root.
+  // stdio: spawn `cargo run -q -p octave-engine` from the repo root.
   // cargo handles incremental rebuild; first launch may take a few
   // seconds, subsequent launches are near-instant.
   return {
     transport: new StdioClientTransport({
       command: "cargo",
-      args: ["run", "-q", "-p", "octave-mcp"],
+      args: ["run", "-q", "-p", "octave-engine"],
       cwd: REPO_ROOT,
     }),
-    describe: `stdio → cargo run -q -p octave-mcp (cwd ${REPO_ROOT})`,
+    describe: `stdio → cargo run -q -p octave-engine (cwd ${REPO_ROOT})`,
   };
 }
 
@@ -79,7 +79,7 @@ function buildTransport(): { transport: Transport; describe: string } {
  * inputSchema as JSON Schema); the SDK's `tool({ inputSchema, execute })`
  * accepts JSON Schema via the `jsonSchema()` helper. Each `execute`
  * round-trips through the MCP client's `callTool` so the agent's tool
- * call lands on the actual octave-mcp server.
+ * call lands on the actual octave-engine server.
  */
 async function buildToolset(mcp: McpClient) {
   const { tools: mcpTools } = await mcp.listTools();

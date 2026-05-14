@@ -72,7 +72,7 @@ impl AudioActorHandle {
         let catalog = Arc::new(DeviceCatalog::new());
         let actor_catalog = Arc::clone(&catalog);
         let join = thread::Builder::new()
-            .name("octave-mcp-audio".into())
+            .name("octave-engine-audio".into())
             .spawn(move || run_actor(rx, actor_catalog))?;
         Ok(Self {
             tx: Some(tx),

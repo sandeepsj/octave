@@ -1,7 +1,7 @@
 [package]
-name        = "octave-mcp"
+name        = "octave-engine"
 version     = "0.1.0"
-description = "MCP server exposing Octave's typed Rust APIs to AI agents over stdio. v0.1: the seven recording_* tools from octave-recorder."
+description = "Octave's audio engine process. Owns the cpal hardware + active streams; speaks low-level MCP (output_*, input_*, stream_*). The handler talks to this over stdio/UDS; never network-bound. See docs/modules/system-architecture.md."
 
 edition.workspace      = true
 rust-version.workspace = true
@@ -26,8 +26,8 @@ tracing-subscriber = { workspace = true }
 uuid               = { workspace = true }
 
 [[bin]]
-name = "octave-mcp"
-path = "src/bin/octave-mcp.rs"
+name = "octave-engine"
+path = "src/bin/octave-engine.rs"
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-//! Subprocess integration test for the `octave-mcp` binary.
+//! Subprocess integration test for the `octave-engine` binary.
 //!
 //! Spawns the built binary, drives it over stdio with raw JSON-RPC,
 //! and verifies the MCP handshake + tools/list + an error path.
@@ -9,10 +9,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Path to the built binary. cargo test sets `CARGO_BIN_EXE_octave-mcp`
+/// Path to the built binary. cargo test sets `CARGO_BIN_EXE_octave-engine`
 /// to the absolute path of the binary it just built — the canonical
 /// way to invoke a binary crate from its own integration test.
-const BIN_ENV: &str = "CARGO_BIN_EXE_octave-mcp";
+const BIN_ENV: &str = "CARGO_BIN_EXE_octave-engine";
 
 fn binary_path() -> String {
     std::env::var(BIN_ENV)
@@ -43,12 +43,12 @@ fn subprocess_handshake_lists_all_tools_and_rejects_unknown() {
         .env("RUST_LOG", "warn")
         // Make sure no developer-shell allowlist leaks in — we want
         // to assert the full 16-tool default surface.
-        .env_remove("OCTAVE_MCP_TOOLS")
+        .env_remove("OCTAVE_ENGINE_TOOLS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn octave-mcp binary");
+        .expect("spawn octave-engine binary");
 
     let mut stdin = child.stdin.take().expect("stdin pipe");
     let stdout = child.stdout.take().expect("stdout pipe");
@@ -81,22 +81,22 @@ fn subprocess_handshake_lists_all_tools_and_rejects_unknown() {
     let tools_resp = read_line_with_deadline(&mut reader, deadline);
     assert!(tools_resp.contains(r#""id":2"#), "tools/list response: {tools_resp}");
     for expected in [
-        "recording_list_devices",
-        "recording_describe_device",
-        "recording_start",
-        "recording_stop",
-        "recording_cancel",
-        "recording_get_levels",
-        "recording_get_status",
-        "playback_list_output_devices",
-        "playback_describe_device",
-        "playback_start",
-        "playback_pause",
-        "playback_resume",
-        "playback_stop",
-        "playback_seek",
-        "playback_get_status",
-        "playback_get_levels",
+        "input_list",
+        "input_describe",
+        "input_start",
+        "input_stop",
+        "input_cancel",
+        "input_levels",
+        "input_status",
+        "output_list",
+        "output_describe",
+        "output_start",
+        "output_pause",
+        "output_resume",
+        "output_stop",
+        "output_seek",
+        "output_status",
+        "output_levels",
     ] {
         assert!(
             tools_resp.contains(&format!("\"{expected}\"")),

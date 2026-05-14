@@ -1,12 +1,21 @@
-//! rmcp tool router — the MCP tool surface.
+//! rmcp tool router — the engine's MCP tool surface.
 //!
-//! Each `#[tool]` method below corresponds to one row in
-//! [`docs/modules/mcp-layer.md`](../../../../docs/modules/mcp-layer.md)
-//! §10.1. Read-only tools (`recording_list_devices`,
-//! `recording_describe_device`) bypass the actor and call the recorder
-//! directly. All seven session-aware tools route through the
-//! [`AudioActorHandle`] so the `!Send` `RecordingHandle`s stay on one
+//! Tools are namespaced into three families:
+//!
+//! - `output_*`  — playback-side device discovery, stream open, start.
+//! - `input_*`   — record-side device discovery, stream open, start, terminal ops.
+//! - `stream_*` is reserved for cross-direction transport (pause / resume / seek)
+//!   in a future tier; for now playback transport lives under `output_*` and
+//!   recording terminal ops under `input_*` (see system-architecture plan §4.3).
+//!
+//! Every session-aware tool routes through [`AudioActorHandle`] so the
+//! `!Send` `RecordingHandle`s and `PlaybackHandle`s stay on one OS
 //! thread (see audio_actor.rs).
+//!
+//! Wire-field convention: every running session is identified by
+//! `stream_id` (UUID v4 string). The handler process layered on top
+//! of this engine has its own `session_id` concept; the engine itself
+//! only knows about streams.
 
 use std::collections::HashSet;
 use std::time::UNIX_EPOCH;
@@ -26,7 +35,7 @@ use crate::types::{
     CapabilitiesJson, CancelResult, DescribeDeviceArgs, DeviceInfoJson, LevelsResult,
     ListDevicesResult, ListOutputDevicesResult, OutputDeviceInfoJson, PlaybackSeekArgs,
     PlaybackSeekResult, PlaybackStartArgs, PlaybackStartResult, PlaybackStatusJson,
-    PlaybackTransportResult, RecordedClipJson, SessionArgs, StartArgs, StartResult, StatusResult,
+    PlaybackTransportResult, RecordedClipJson, StartArgs, StartResult, StatusResult, StreamArgs,
 };
 
 /// The MCP server's stateful root. Holds the actor handle so each tool
@@ -87,11 +96,15 @@ impl OctaveServer {
 
 #[tool_router]
 impl OctaveServer {
+    // ============================================================
+    //   input_*  (recording side)
+    // ============================================================
+
     #[tool(
-        name = "recording_list_devices",
-        description = "Enumerate every input device the host can see across all backends. Returns an array with each device's stable id, human name, backend, default-input flag, and channel count. Safe and read-only."
+        name = "input_list",
+        description = "Enumerate every input (recording) device the host can see across all backends. Returns each device's stable id, human name, backend, default-input flag, and channel count. Safe and read-only."
     )]
-    async fn recording_list_devices(&self) -> Result<Json<ListDevicesResult>, ErrorData> {
+    async fn input_list(&self) -> Result<Json<ListDevicesResult>, ErrorData> {
         let devices = self
             .actor
             .catalog()
@@ -103,10 +116,10 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "recording_describe_device",
-        description = "Return supported sample rates, channel counts, and buffer sizes for one device. Use the device_id from recording_list_devices."
+        name = "input_describe",
+        description = "Return supported sample rates, channel counts, and buffer sizes for one input device. Use the device_id from input_list."
     )]
-    async fn recording_describe_device(
+    async fn input_describe(
         &self,
         Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
     ) -> Result<Json<CapabilitiesJson>, ErrorData> {
@@ -118,14 +131,14 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "recording_start",
-        description = "Open the named device, start the audio callback, and begin writing 32-bit float WAV to output_path. Returns a session_id you pass to subsequent tools. DESTRUCTIVE: overwrites output_path if it exists.",
+        name = "input_start",
+        description = "Open the named input device, start the audio callback, and begin writing 32-bit float WAV to output_path. Returns a stream_id you pass to subsequent tools. DESTRUCTIVE: overwrites output_path if it exists.",
         annotations(
-            title = "Start a recording",
+            title = "Start a recording stream",
             destructive_hint = true
         )
     )]
-    async fn recording_start(
+    async fn input_start(
         &self,
         Parameters(args): Parameters<StartArgs>,
     ) -> Result<Json<StartResult>, ErrorData> {
@@ -148,7 +161,7 @@ impl OctaveServer {
             .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
         match reply {
             Ok(r) => Ok(Json(StartResult {
-                session_id: r.session_id.to_string(),
+                stream_id: r.session_id.to_string(),
                 started_at_unix_seconds: r
                     .started_at
                     .duration_since(UNIX_EPOCH)
@@ -160,25 +173,25 @@ impl OctaveServer {
                 Err(ErrorData::internal_error(s, None))
             }
             Err(StartReplyError::TooManySessions) => Err(ErrorData::invalid_request(
-                "TooManySessions: 8 concurrent recording sessions max in v0.1",
+                "TooManySessions: 8 concurrent recording streams max in v0.1",
                 None,
             )),
         }
     }
 
     #[tool(
-        name = "recording_stop",
-        description = "Stop a recording cleanly. Drains the buffer, finalizes the WAV header, fsyncs, returns the clip metadata."
+        name = "input_stop",
+        description = "Stop a recording stream cleanly. Drains the buffer, finalizes the WAV header, fsyncs, returns the clip metadata."
     )]
-    async fn recording_stop(
+    async fn input_stop(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<RecordedClipJson>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
             .send(Command::Stop {
-                session_id,
+                session_id: stream_id,
                 reply: tx,
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -188,7 +201,7 @@ impl OctaveServer {
         match reply {
             Ok(c) => Ok(Json(c)),
             Err(SessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -196,19 +209,19 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "recording_cancel",
-        description = "Stop a recording and delete the partial file. Use when the recording is unwanted. DESTRUCTIVE: removes the output file.",
+        name = "input_cancel",
+        description = "Stop a recording stream and delete the partial file. Use when the recording is unwanted. DESTRUCTIVE: removes the output file.",
         annotations(destructive_hint = true)
     )]
-    async fn recording_cancel(
+    async fn input_cancel(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<CancelResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
             .send(Command::Cancel {
-                session_id,
+                session_id: stream_id,
                 reply: tx,
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -218,7 +231,7 @@ impl OctaveServer {
         match reply {
             Ok((path, deleted)) => Ok(Json(CancelResult { path, deleted })),
             Err(SessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -226,18 +239,18 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "recording_get_levels",
-        description = "Read current per-channel peak and RMS levels in dBFS. Safe to poll at meter rates (e.g., 30 Hz). Returns NEG_INFINITY before the meter is live."
+        name = "input_levels",
+        description = "Read current per-channel peak and RMS input levels in dBFS. Safe to poll at meter rates (e.g., 30 Hz). Returns NEG_INFINITY before the meter is live."
     )]
-    async fn recording_get_levels(
+    async fn input_levels(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<LevelsResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
             .send(Command::GetLevels {
-                session_id,
+                session_id: stream_id,
                 reply: tx,
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -247,7 +260,7 @@ impl OctaveServer {
         match reply {
             Ok(l) => Ok(Json(l)),
             Err(SessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -255,18 +268,18 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "recording_get_status",
-        description = "Return the recorder's state, xrun count, dropped-sample count, and elapsed seconds since recording_start."
+        name = "input_status",
+        description = "Return the input stream's state, xrun count, dropped-sample count, and elapsed seconds since input_start."
     )]
-    async fn recording_get_status(
+    async fn input_status(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<StatusResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
             .send(Command::GetStatus {
-                session_id,
+                session_id: stream_id,
                 reply: tx,
             })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -276,7 +289,7 @@ impl OctaveServer {
         match reply {
             Ok(s) => Ok(Json(s)),
             Err(SessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -284,16 +297,14 @@ impl OctaveServer {
     }
 
     // ============================================================
-    //   Playback tools
+    //   output_*  (playback side)
     // ============================================================
 
     #[tool(
-        name = "playback_list_output_devices",
-        description = "Enumerate every output device the host can see across all backends. Returns each device's stable id, name, backend, default-output flag, and channel count. Safe and read-only."
+        name = "output_list",
+        description = "Enumerate every output (playback) device the host can see across all backends. Returns each device's stable id, name, backend, default-output flag, and channel count. Safe and read-only."
     )]
-    async fn playback_list_output_devices(
-        &self,
-    ) -> Result<Json<ListOutputDevicesResult>, ErrorData> {
+    async fn output_list(&self) -> Result<Json<ListOutputDevicesResult>, ErrorData> {
         let devices = self
             .actor
             .catalog()
@@ -305,10 +316,10 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_describe_device",
-        description = "Return supported sample rates, channel counts, and buffer sizes for one output device. Use the device_id from playback_list_output_devices."
+        name = "output_describe",
+        description = "Return supported sample rates, channel counts, and buffer sizes for one output device. Use the device_id from output_list."
     )]
-    async fn playback_describe_device(
+    async fn output_describe(
         &self,
         Parameters(DescribeDeviceArgs { device_id }): Parameters<DescribeDeviceArgs>,
     ) -> Result<Json<CapabilitiesJson>, ErrorData> {
@@ -323,10 +334,10 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_start",
-        description = "Open the named output device, load the source (file path or in-memory f32 buffer), and begin playback. Single playback session at a time. Returns a session_id for subsequent transport tools."
+        name = "output_start",
+        description = "Open the named output device, load the source (file path or in-memory f32 buffer), and begin playback. Single playback stream at a time. Returns a stream_id for subsequent transport tools."
     )]
-    async fn playback_start(
+    async fn output_start(
         &self,
         Parameters(args): Parameters<PlaybackStartArgs>,
     ) -> Result<Json<PlaybackStartResult>, ErrorData> {
@@ -373,7 +384,7 @@ impl OctaveServer {
             .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?;
         match reply {
             Ok(r) => Ok(Json(PlaybackStartResult {
-                session_id: r.session_id.to_string(),
+                stream_id: r.session_id.to_string(),
                 started_at_unix_seconds: r
                     .started_at
                     .duration_since(std::time::UNIX_EPOCH)
@@ -385,7 +396,7 @@ impl OctaveServer {
             })),
             Err(PlaybackStartError::AlreadyPlaying { current_session }) => {
                 Err(ErrorData::invalid_request(
-                    format!("AlreadyPlaying: current_session={current_session}"),
+                    format!("AlreadyPlaying: current_stream={current_session}"),
                     None,
                 ))
             }
@@ -394,49 +405,49 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_pause",
-        description = "Pause the active playback session. State transitions to Paused; resume with playback_resume."
+        name = "output_pause",
+        description = "Pause the active output stream. State transitions to Paused; resume with output_resume."
     )]
-    async fn playback_pause(
+    async fn output_pause(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<PlaybackTransportResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
-            .send(Command::PlaybackPause { session_id, reply: tx })
+            .send(Command::PlaybackPause { session_id: stream_id, reply: tx })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         playback_transport_reply(rx).await
     }
 
     #[tool(
-        name = "playback_resume",
-        description = "Resume a paused playback session from its current position."
+        name = "output_resume",
+        description = "Resume a paused output stream from its current position."
     )]
-    async fn playback_resume(
+    async fn output_resume(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<PlaybackTransportResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
-            .send(Command::PlaybackResume { session_id, reply: tx })
+            .send(Command::PlaybackResume { session_id: stream_id, reply: tx })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         playback_transport_reply(rx).await
     }
 
     #[tool(
-        name = "playback_stop",
-        description = "Stop the active playback session. Drops the device, joins the reader thread, returns the final status."
+        name = "output_stop",
+        description = "Stop the active output stream. Drops the device, joins the reader thread, returns the final status."
     )]
-    async fn playback_stop(
+    async fn output_stop(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<PlaybackStatusJson>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
-            .send(Command::PlaybackStop { session_id, reply: tx })
+            .send(Command::PlaybackStop { session_id: stream_id, reply: tx })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let reply = rx
             .await
@@ -444,7 +455,7 @@ impl OctaveServer {
         match reply {
             Ok(s) => Ok(Json(s)),
             Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -452,30 +463,30 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_seek",
+        name = "output_seek",
         description = "Seek to a position in the source. Provide either position_seconds (f64) or position_frames (u64); if both are given, frames win. User-visible cost: one period of silence at the seek point (~1.3 ms at 48 kHz / 64 buffer)."
     )]
-    async fn playback_seek(
+    async fn output_seek(
         &self,
         Parameters(args): Parameters<PlaybackSeekArgs>,
     ) -> Result<Json<PlaybackSeekResult>, ErrorData> {
-        let session_id = parse_session_id(&args.session_id)?;
+        let stream_id = parse_stream_id(&args.stream_id)?;
 
-        // Resolve the seek target. We need the session's sample_rate to
+        // Resolve the seek target. We need the stream's sample_rate to
         // convert seconds → frames; ask the actor for status first.
         let target_frames = if let Some(f) = args.position_frames {
             f
         } else if let Some(secs) = args.position_seconds {
             let (st_tx, st_rx) = oneshot::channel();
             self.actor
-                .send(Command::PlaybackGetStatus { session_id, reply: st_tx })
+                .send(Command::PlaybackGetStatus { session_id: stream_id, reply: st_tx })
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             let status = st_rx
                 .await
                 .map_err(|_| ErrorData::internal_error("audio actor dropped reply", None))?
                 .map_err(|e| match e {
                     PlaybackSessionError::NotFound(id) => ErrorData::invalid_params(
-                        format!("session_not_found: {id}"),
+                        format!("stream_not_found: {id}"),
                         None,
                     ),
                     other => ErrorData::internal_error(other.to_string(), None),
@@ -485,7 +496,7 @@ impl OctaveServer {
             frames
         } else {
             return Err(ErrorData::invalid_params(
-                "playback_seek: provide position_seconds or position_frames",
+                "output_seek: provide position_seconds or position_frames",
                 None,
             ));
         };
@@ -493,7 +504,7 @@ impl OctaveServer {
         let (tx, rx) = oneshot::channel();
         self.actor
             .send(Command::PlaybackSeek {
-                session_id,
+                session_id: stream_id,
                 target_frames,
                 reply: tx,
             })
@@ -504,7 +515,7 @@ impl OctaveServer {
         match reply {
             Ok(r) => Ok(Json(r)),
             Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -512,17 +523,17 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_get_status",
-        description = "Return the playback session's state, position, duration, and xrun count. Safe to poll."
+        name = "output_status",
+        description = "Return the output stream's state, position, duration, and xrun count. Safe to poll."
     )]
-    async fn playback_get_status(
+    async fn output_status(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<PlaybackStatusJson>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
-            .send(Command::PlaybackGetStatus { session_id, reply: tx })
+            .send(Command::PlaybackGetStatus { session_id: stream_id, reply: tx })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let reply = rx
             .await
@@ -530,7 +541,7 @@ impl OctaveServer {
         match reply {
             Ok(s) => Ok(Json(s)),
             Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -538,17 +549,17 @@ impl OctaveServer {
     }
 
     #[tool(
-        name = "playback_get_levels",
+        name = "output_levels",
         description = "Read current per-channel peak and RMS output levels in dBFS. Safe to poll at meter rates (~30 Hz). Returns -180 dBFS before the first audio buffer is rendered."
     )]
-    async fn playback_get_levels(
+    async fn output_levels(
         &self,
-        Parameters(SessionArgs { session_id }): Parameters<SessionArgs>,
+        Parameters(StreamArgs { stream_id }): Parameters<StreamArgs>,
     ) -> Result<Json<LevelsResult>, ErrorData> {
-        let session_id = parse_session_id(&session_id)?;
+        let stream_id = parse_stream_id(&stream_id)?;
         let (tx, rx) = oneshot::channel();
         self.actor
-            .send(Command::PlaybackGetLevels { session_id, reply: tx })
+            .send(Command::PlaybackGetLevels { session_id: stream_id, reply: tx })
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let reply = rx
             .await
@@ -556,7 +567,7 @@ impl OctaveServer {
         match reply {
             Ok(l) => Ok(Json(l)),
             Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-                format!("session_not_found: {id}"),
+                format!("stream_not_found: {id}"),
                 None,
             )),
             Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -573,7 +584,7 @@ async fn playback_transport_reply(
     match reply {
         Ok(r) => Ok(Json(r)),
         Err(PlaybackSessionError::NotFound(id)) => Err(ErrorData::invalid_params(
-            format!("session_not_found: {id}"),
+            format!("stream_not_found: {id}"),
             None,
         )),
         Err(e) => Err(ErrorData::internal_error(e.to_string(), None)),
@@ -583,16 +594,16 @@ async fn playback_transport_reply(
 #[tool_handler]
 impl ServerHandler for OctaveServer {}
 
-fn parse_session_id(s: &str) -> Result<Uuid, ErrorData> {
+fn parse_stream_id(s: &str) -> Result<Uuid, ErrorData> {
     Uuid::parse_str(s).map_err(|_| {
-        ErrorData::invalid_params(format!("invalid session_id: {s} is not a UUID"), None)
+        ErrorData::invalid_params(format!("invalid stream_id: {s} is not a UUID"), None)
     })
 }
 
 /// Format an error enum variant as `EnumName::DebugBody` per
-/// mcp-layer plan §10.3 wire-contract format. Uses Debug so the
-/// variant name + structured fields land verbatim — agents pattern-
-/// match on the variant prefix to recover from typed failures.
+/// the wire-contract format. Uses Debug so the variant name + structured
+/// fields land verbatim — agents pattern-match on the variant prefix to
+/// recover from typed failures.
 ///
 /// Used by every site in this module that converts a typed engine
 /// error into the JSON-RPC `error.message` string. Centralised so

@@ -3,7 +3,7 @@
 //!
 //! `cpal::Stream` is `!Send` on every backend, so the engine's
 //! `PlaybackHandle` cannot live in `tauri::State` (which must be
-//! `Send + Sync`). Mirrors `octave-mcp::audio_actor`'s playback half:
+//! `Send + Sync`). Mirrors `octave-engine::audio_actor`'s playback half:
 //! one OS thread holds `Option<PlaybackHandle>`, async Tauri commands
 //! send [`Command`]s through a bounded crossbeam channel and `await`
 //! a `tokio::sync::oneshot` reply.
@@ -41,7 +41,7 @@ const COMMAND_QUEUE: usize = 16;
 #[derive(Clone)]
 pub struct AppActorHandle {
     /// `Option` so `Drop` can `take` and close the channel before
-    /// joining the thread — same trick as `octave-mcp::audio_actor`.
+    /// joining the thread — same trick as `octave-engine::audio_actor`.
     /// Without it the actor's `rx.recv()` would never see the close,
     /// and `handle.join()` would deadlock.
     tx: Option<Sender<Command>>,
@@ -133,7 +133,7 @@ pub enum Command {
     //  Recording
     // ============================================================
     /// Open + arm + record collapsed into one atomic action (rolls
-    /// back on failure — same shape as `octave-mcp::audio_actor`'s
+    /// back on failure — same shape as `octave-engine::audio_actor`'s
     /// `start_session` helper). Returns the output path and started-
     /// at instant; the UI uses both to display "recording → /tmp/…
     /// 0:03". `fold_to_mono` is honoured at Stop time (see
@@ -405,7 +405,7 @@ fn run_actor(rx: Receiver<Command>, catalog: Arc<DeviceCatalog>) {
 /// Open + arm + record on the recorder catalog, rolling back on
 /// failure (close the handle on any error so we don't leak the
 /// reader thread / cpal stream). Mirror of
-/// `octave-mcp::audio_actor::start_session` for the playback-side
+/// `octave-engine::audio_actor::start_session` for the playback-side
 /// single-session app actor.
 fn start_recording(
     spec: RecordingSpec,

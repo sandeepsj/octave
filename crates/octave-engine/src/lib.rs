@@ -1,15 +1,15 @@
-//! `octave-mcp` — Model Context Protocol server exposing Octave's typed
-//! Rust APIs as tools that AI agents (Claude Desktop, Claude Code,
-//! custom) can call.
+//! `octave-engine` — Octave's audio engine process.
 //!
-//! v0.1 ships the seven `recording_*` tools defined in
-//! [`docs/modules/record-audio.md`](https://github.com/sandeepsj/octave/blob/main/docs/modules/record-audio.md)
-//! §10. The plan for the layer itself lives in
-//! [`docs/modules/mcp-layer.md`](https://github.com/sandeepsj/octave/blob/main/docs/modules/mcp-layer.md).
+//! Owns all `cpal::Device` handles and active streams. Speaks
+//! low-level MCP — `output_*` / `input_*` / `stream_*` tools (see
+//! `OctaveServer::all_tool_names`). The handler process is the
+//! intended client; external agents (Claude Desktop) should connect
+//! to the **handler** instead, not the engine. See
+//! [`docs/modules/system-architecture.md`](https://github.com/sandeepsj/octave/blob/main/docs/modules/system-architecture.md).
 //!
 //! See [`serve`] for the entry point. Library consumers run it from
-//! their own tokio runtime; the `octave-mcp` binary creates a runtime
-//! and calls into it.
+//! their own tokio runtime; the `octave-engine` binary creates a
+//! runtime and calls into it.
 
 mod audio_actor;
 mod handler;
@@ -39,7 +39,7 @@ pub enum ServerError {
 /// per the MCP stdio convention.
 ///
 /// # Tool filtering
-/// Reads the `OCTAVE_MCP_TOOLS` environment variable as a
+/// Reads the `OCTAVE_ENGINE_TOOLS` environment variable as a
 /// comma-separated allowlist of tool names. Empty or unset = all tools
 /// enabled. Set = only listed tools are advertised by `tools/list` and
 /// accepted by `call_tool`. Unknown names are ignored (logged as a
@@ -59,7 +59,7 @@ pub async fn serve() -> Result<(), ServerError> {
         None => {
             tracing::info!(
                 tools = ?OctaveServer::all_tool_names(),
-                "OCTAVE_MCP_TOOLS unset; advertising all tools"
+                "OCTAVE_ENGINE_TOOLS unset; advertising all tools"
             );
             OctaveServer::new(actor)
         }
@@ -68,10 +68,10 @@ pub async fn serve() -> Result<(), ServerError> {
                 OctaveServer::all_tool_names().into_iter().collect();
             let unknown: Vec<&String> = allowed.iter().filter(|n| !known.contains(*n)).collect();
             if !unknown.is_empty() {
-                tracing::warn!(?unknown, "OCTAVE_MCP_TOOLS contains unknown names (ignored)");
+                tracing::warn!(?unknown, "OCTAVE_ENGINE_TOOLS contains unknown names (ignored)");
             }
             let (server, enabled) = OctaveServer::with_allowed_tools(actor, &allowed);
-            tracing::info!(?enabled, "OCTAVE_MCP_TOOLS allowlist applied");
+            tracing::info!(?enabled, "OCTAVE_ENGINE_TOOLS allowlist applied");
             server
         }
     };
@@ -89,11 +89,11 @@ pub async fn serve() -> Result<(), ServerError> {
     Ok(())
 }
 
-/// Parse `OCTAVE_MCP_TOOLS` into an allowlist set. Returns `None` when
-/// the variable is unset or empty/whitespace, in which case all tools
-/// remain enabled.
+/// Parse `OCTAVE_ENGINE_TOOLS` into an allowlist set. Returns `None`
+/// when the variable is unset or empty/whitespace, in which case all
+/// tools remain enabled.
 fn parse_tools_env() -> Option<std::collections::HashSet<String>> {
-    let raw = std::env::var("OCTAVE_MCP_TOOLS").ok()?;
+    let raw = std::env::var("OCTAVE_ENGINE_TOOLS").ok()?;
     let set: std::collections::HashSet<String> = raw
         .split(',')
         .map(str::trim)
@@ -112,60 +112,60 @@ mod tests {
         // Use unique scopes per case so concurrent tests don't collide.
         // SAFETY: env var mutation in tests; serial within this fn.
         unsafe {
-            std::env::remove_var("OCTAVE_MCP_TOOLS");
+            std::env::remove_var("OCTAVE_ENGINE_TOOLS");
         }
         assert!(parse_tools_env().is_none(), "unset → None");
 
         unsafe {
-            std::env::set_var("OCTAVE_MCP_TOOLS", "");
+            std::env::set_var("OCTAVE_ENGINE_TOOLS", "");
         }
         assert!(parse_tools_env().is_none(), "empty → None");
 
         unsafe {
-            std::env::set_var("OCTAVE_MCP_TOOLS", "  ,  ,");
+            std::env::set_var("OCTAVE_ENGINE_TOOLS", "  ,  ,");
         }
         assert!(parse_tools_env().is_none(), "whitespace+commas → None");
 
         unsafe {
             std::env::set_var(
-                "OCTAVE_MCP_TOOLS",
-                " recording_start , recording_stop ,recording_start",
+                "OCTAVE_ENGINE_TOOLS",
+                " input_start , input_stop ,input_start",
             );
         }
         let s = parse_tools_env().expect("Some");
         assert_eq!(s.len(), 2);
-        assert!(s.contains("recording_start"));
-        assert!(s.contains("recording_stop"));
+        assert!(s.contains("input_start"));
+        assert!(s.contains("input_stop"));
 
         unsafe {
-            std::env::remove_var("OCTAVE_MCP_TOOLS");
+            std::env::remove_var("OCTAVE_ENGINE_TOOLS");
         }
     }
 
-    /// Plan §4.2 / §10.1 single-source-of-truth for the tool set.
-    /// Asserting the exact list catches accidental adds/drops/renames
-    /// at compile-time of the test rather than at first agent contact.
+    /// System-architecture plan §4.3 single-source-of-truth for the
+    /// tool set. Asserting the exact list catches accidental adds /
+    /// drops / renames at compile-time of the test.
     #[test]
     fn all_tool_names_matches_published_set_of_16() {
         let mut got = OctaveServer::all_tool_names();
         got.sort();
         let expected = [
-            "playback_describe_device",
-            "playback_get_levels",
-            "playback_get_status",
-            "playback_list_output_devices",
-            "playback_pause",
-            "playback_resume",
-            "playback_seek",
-            "playback_start",
-            "playback_stop",
-            "recording_cancel",
-            "recording_describe_device",
-            "recording_get_levels",
-            "recording_get_status",
-            "recording_list_devices",
-            "recording_start",
-            "recording_stop",
+            "input_cancel",
+            "input_describe",
+            "input_levels",
+            "input_list",
+            "input_start",
+            "input_status",
+            "input_stop",
+            "output_describe",
+            "output_levels",
+            "output_list",
+            "output_pause",
+            "output_resume",
+            "output_seek",
+            "output_start",
+            "output_status",
+            "output_stop",
         ];
         assert_eq!(got.len(), 16, "expected 16 tools, got {}: {got:?}", got.len());
         assert_eq!(got.iter().map(String::as_str).collect::<Vec<_>>(), expected);

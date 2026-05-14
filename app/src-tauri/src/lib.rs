@@ -2,7 +2,7 @@
 //! React UI via `#[tauri::command]` handlers.
 //!
 //! Engine surface mirrored to the UI (and, separately, to the agent
-//! via `octave-mcp`):
+//! via `octave-engine`):
 //!
 //! - `list_output_devices` / `list_input_devices` — enumerate devices.
 //! - `playback_start` / `playback_pause` / `playback_resume` /

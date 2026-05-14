@@ -26,7 +26,7 @@ serde_json = "1"
 thiserror  = "2"
 # `cpal::Stream` is `!Send` on every backend, so `PlaybackHandle`
 # can't sit in `tauri::State` (which must be `Send + Sync`). Adopt the
-# same actor pattern as `octave-mcp::audio_actor`: a dedicated thread
+# same actor pattern as `octave-engine::audio_actor`: a dedicated thread
 # owns the handle, async Tauri commands send `Command`s through a
 # crossbeam channel and `await` a tokio oneshot reply.
 crossbeam-channel = "0.5"

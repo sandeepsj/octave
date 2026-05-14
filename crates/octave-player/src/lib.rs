@@ -20,8 +20,8 @@
 //! / [`PlaybackHandle::seek`] / [`PlaybackHandle::stop`] /
 //! [`PlaybackHandle::status`] / [`PlaybackHandle::levels`] /
 //! [`PlaybackHandle::close`]. Working example binary at
-//! `examples/play-demo.rs`. The MCP tool surface (`playback_*` tools)
-//! lives in the separate `octave-mcp` crate.
+//! `examples/play-demo.rs`. The MCP tool surface (`output_*` tools)
+//! lives in the separate `octave-engine` crate.
 
 #![cfg_attr(test, allow(clippy::float_cmp, clippy::cast_precision_loss))]
 

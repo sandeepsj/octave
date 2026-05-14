@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use octave_recorder::{Backend, BufferSize, RecorderState};
 
-/// Result of `recording_list_devices`.
+/// Result of `input_list`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListDevicesResult {
     pub devices: Vec<DeviceInfoJson>,
@@ -81,10 +81,10 @@ impl From<octave_recorder::DeviceInfo> for DeviceInfoJson {
     }
 }
 
-/// Argument to `recording_describe_device`.
+/// Argument to `input_describe` / `output_describe`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DescribeDeviceArgs {
-    /// Opaque device identifier returned from `recording_list_devices`.
+    /// Opaque device identifier returned from `input_list` / `output_list`.
     pub device_id: String,
 }
 
@@ -141,10 +141,10 @@ impl From<BufferSizeJson> for BufferSize {
 // `octave_recorder::BufferSize` re-exports, so a separate impl would
 // conflict with the one above. Both engines use the same enum.
 
-/// Argument to `recording_start`.
+/// Argument to `input_start`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StartArgs {
-    /// Opaque device identifier from `recording_list_devices`.
+    /// Opaque device identifier from `input_list`.
     pub device_id: String,
     /// Capture rate in Hz. Common: 48000 (default for production audio).
     pub sample_rate: u32,
@@ -156,24 +156,26 @@ pub struct StartArgs {
     pub output_path: PathBuf,
 }
 
-/// Result of `recording_start`.
+/// Result of `input_start`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StartResult {
-    /// Pass this to subsequent tools to refer to the running session.
+    /// Pass this to subsequent tools to refer to the running stream.
     /// UUID v4, serialized as a string (e.g. `"7c9e...-..."`).
-    pub session_id: String,
+    pub stream_id: String,
     /// Unix-epoch seconds when recording began. Use for elapsed math.
     pub started_at_unix_seconds: u64,
 }
 
-/// Argument shared by all session-bound tools.
+/// Argument shared by all stream-bound tools (transport / status / levels
+/// / stop / cancel). The handler process layered on top has its own
+/// `session_id` concept; the engine only knows about streams.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SessionArgs {
-    /// UUID v4 string returned from `recording_start`.
-    pub session_id: String,
+pub struct StreamArgs {
+    /// UUID v4 string returned from `input_start` / `output_start`.
+    pub stream_id: String,
 }
 
-/// Result of `recording_stop` — a finalized recording.
+/// Result of `input_stop` — a finalized recording.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RecordedClipJson {
     pub path: PathBuf,
@@ -190,7 +192,7 @@ pub struct RecordedClipJson {
     pub peak_dbfs: Vec<f32>,
 }
 
-/// Result of `recording_cancel`.
+/// Result of `input_cancel`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CancelResult {
     /// The path the partial file was at; `deleted` reports whether
@@ -199,14 +201,14 @@ pub struct CancelResult {
     pub deleted: bool,
 }
 
-/// Result of `recording_get_levels`.
+/// Result of `input_levels` / `output_levels`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LevelsResult {
     pub peak_dbfs: Vec<f32>,
     pub rms_dbfs: Vec<f32>,
 }
 
-/// Result of `recording_get_status`.
+/// Result of `input_status`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StatusResult {
     pub state: RecorderStateJson,
@@ -245,10 +247,10 @@ impl From<RecorderState> for RecorderStateJson {
 }
 
 // ============================================================================
-//   Playback wire types — mirror of the recording set, for `playback_*` tools.
+//   Playback wire types — mirror of the recording set, for `output_*` tools.
 // ============================================================================
 
-/// Result of `playback_list_output_devices`.
+/// Result of `output_list`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListOutputDevicesResult {
     pub devices: Vec<OutputDeviceInfoJson>,
@@ -296,7 +298,7 @@ impl From<octave_player::OutputCapabilities> for CapabilitiesJson {
     }
 }
 
-/// Source descriptor for `playback_start`. v0.1 supports `file` (path on
+/// Source descriptor for `output_start`. v0.1 supports `file` (path on
 /// disk to a 32-bit float WAV / RF64) and `buffer` (inline f32 array,
 /// capped at 100 MB by the MCP layer to avoid pathological JSON-RPC
 /// payloads — agents wanting larger should write a temp file first).
@@ -315,7 +317,7 @@ pub enum PlaybackSourceJson {
     },
 }
 
-/// Argument to `playback_start`.
+/// Argument to `output_start`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlaybackStartArgs {
     pub device_id: String,
@@ -323,10 +325,10 @@ pub struct PlaybackStartArgs {
     pub buffer_size: BufferSizeJson,
 }
 
-/// Result of `playback_start`.
+/// Result of `output_start`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct PlaybackStartResult {
-    pub session_id: String,
+    pub stream_id: String,
     pub started_at_unix_seconds: u64,
     /// Total source duration in seconds, when known. `None` for unbounded
     /// sources (none in v0.1, but reserved for future streaming sources).
@@ -401,11 +403,11 @@ impl From<octave_player::PlaybackStatus> for PlaybackStatusJson {
     }
 }
 
-/// Argument to `playback_seek`. One of `position_seconds` /
+/// Argument to `output_seek`. One of `position_seconds` /
 /// `position_frames` is required; if both are given, frames win.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlaybackSeekArgs {
-    pub session_id: String,
+    pub stream_id: String,
     pub position_seconds: Option<f64>,
     pub position_frames: Option<u64>,
 }

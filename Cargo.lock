@@ -823,7 +823,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "octave-mcp"
+name = "octave-engine"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
